@@ -1,0 +1,2 @@
+A basic filesystem implementation using FUSE written on top of the B2 cloud storage API.
+Conceptually simiarly to the https://github.com/s3fs-fuse/s3fs-fuse project.
