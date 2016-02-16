@@ -1,3 +1,18 @@
+/*----- Numerical Constants -----*/
+
+#define B2FS_SUCCESS 0x00
+#define B2FS_GENERIC_ERROR -0x01
+#define B2FS_GENERIC_NETWORK_ERROR -0x02
+#define B2FS_NOMEM -0x04
+
+#define B2FS_ACCOUNT_ID_LEN 16
+#define B2FS_APP_KEY_LEN 64
+#define B2FS_SMALL_GENERIC_BUFFER 128
+
+// So the preprocessor won't complain.
+#undef FUSE_USE_VERSION
+#define FUSE_USE_VERSION 30
+
 /*----- System Includes -----*/
 
 #include <fuse.h>
@@ -13,21 +28,6 @@
 /*----- Local Includes -----*/
 
 #include "b64/cencode.h"
-
-/*----- Numerical Constants -----*/
-
-#define B2FS_SUCCESS 0x00
-#define B2FS_GENERIC_ERROR -0x01
-#define B2FS_GENERIC_NETWORK_ERROR -0x02
-#define B2FS_NOMEM -0x04
-
-#define B2FS_ACCOUNT_ID_LEN 16
-#define B2FS_APP_KEY_LEN 64
-#define B2FS_SMALL_GENERIC_BUFFER 128
-
-// So the preprocessor won't complain.
-#undef FUSE_USE_VERSION
-#define FUSE_USE_VERSION 30
 
 /*----- Macro Declarations -----*/
 
@@ -79,6 +79,7 @@ int b2fs_readlink(const char *path, char *buf, size_t size);
 int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *info);
 int b2fs_mknod(const char *path, mode_t mode, dev_t rdev);
 int b2fs_mkdir(const char *path, mode_t mode);
+int b2fs_symlink(const char *from, const char *to);
 int b2fs_unlink(const char *path);
 int b2fs_rmdir(const char *path);
 int b2fs_rename(const char *from, const char *to);
@@ -93,7 +94,7 @@ int b2fs_write(const char *path, const char *buf, size_t size, off_t offset, str
 int b2fs_statfs(const char *path, struct statvfs *buf);
 int b2fs_release(const char *path, struct fuse_file_info *info);
 int b2fs_fsync(const char *path, int crap, struct fuse_file_info *info);
-int b2fs_access(const char *path, mode_t mode);
+int b2fs_access(const char *path, int mode);
 
 // Network Functions.
 
@@ -114,11 +115,35 @@ const char *base = "https://api.backblaze.com/b2api/v1";
 int main(int argc, char **argv) {
   int c, index, retval;
   b2_authentication_t auth;
-  char *config = "b2fs.yml", *mount_point = "~/b2", auth_token[B2FS_SMALL_GENERIC_BUFFER];
+  char *config = "b2fs.yml", *mount_point = NULL, auth_token[B2FS_SMALL_GENERIC_BUFFER], *fuse_args;
   struct option long_options[] = {
     {"config", required_argument, 0, 'c'},
     {"mount", required_argument, 0, 'm'},
     {0, 0, 0, 0}
+  };
+
+  // Create FUSE function mapping.
+  struct fuse_operations mappings = {
+    .getattr    = b2fs_getattr,
+    .readlink   = b2fs_readlink,
+    .readdir    = b2fs_readdir,
+    .mknod      = b2fs_mknod,
+    .mkdir      = b2fs_mkdir,
+    .unlink     = b2fs_unlink,
+    .rmdir      = b2fs_rmdir,
+    .rename     = b2fs_rename,
+    .link       = b2fs_link,
+    .chmod      = b2fs_chmod,
+    .chown      = b2fs_chown,
+    .truncate   = b2fs_truncate,
+    .utime      = b2fs_utime,
+    .open       = b2fs_open,
+    .read       = b2fs_read,
+    .write      = b2fs_write,
+    .statfs     = b2fs_statfs,
+    .release    = b2fs_release,
+    .fsync      = b2fs_fsync,
+    .access     = b2fs_access
   };
 
   // Get CLI options.
@@ -131,6 +156,10 @@ int main(int argc, char **argv) {
       default:
         print_usage(0);
     }
+  }
+  if (!mount_point) {
+    write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mountpoint.\n");
+    print_usage(0);
   }
 
   // Get auth information from the config file.
@@ -147,8 +176,9 @@ int main(int argc, char **argv) {
     write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
   }
 
-  // We are authenticated and have a valid token. Now the real work begins.
-  // TODO: Write the real filesystem logic.
+  // We are authenticated and have a valid token. Start up FUSE.
+  argv[0] = mount_point;
+  return fuse_main(1, argv, &mappings, auth_token);
 }
 
 // TODO: Implement this function.
@@ -185,6 +215,11 @@ int b2fs_mkdir(const char *path, mode_t mode) {
 }
 
 int b2fs_symlink(const char *from, const char *to) {
+  return -ENOTSUP;
+}
+
+// TODO: Implement this function.
+int b2fs_unlink(const char *path) {
   return -ENOTSUP;
 }
 
@@ -248,7 +283,7 @@ int b2fs_fsync(const char *path, int crap, struct fuse_file_info *info) {
   return -ENOTSUP;
 }
 
-int b2fs_access(const char *path, mode_t mode) {
+int b2fs_access(const char *path, int mode) {
   return -ENOTSUP;
 }
 
