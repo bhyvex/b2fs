@@ -485,6 +485,7 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
       // No cURL errors occured, time to check for HTTP errors...
       long code;
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+      curl_easy_cleanup(curl);
 
       if (code == 200) {
         int token_count = 0;
@@ -540,9 +541,11 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
       // FIXME: Maybe add more detailed error handling here.
       strncpy(auth_info->token, curl_easy_strerror(res), B2FS_TOKEN_LEN - 1);
       auth_info->token[B2FS_TOKEN_LEN - 1] = '\0';
+      curl_easy_cleanup(curl);
       return B2FS_GENERIC_NETWORK_ERROR;
     }
   } else {
+    curl_easy_cleanup(curl);
     return B2FS_GENERIC_ERROR;
   }
 }
