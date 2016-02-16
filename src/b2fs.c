@@ -36,6 +36,8 @@
 #include "b64/cencode.h"
 #include "jsmn/jsmn.h"
 #include "structures/hash.h"
+#include "structures/bitmap.h"
+#include "structures/keytree.h"
 
 /*----- Macro Declarations -----*/
 
@@ -75,6 +77,17 @@ typedef struct b2_account {
   char account_id[B2FS_ACCOUNT_ID_LEN];
   char app_key[B2FS_APP_KEY_LEN];
 } b2_account_t;
+
+typedef struct b2fs_file_chunk {
+  int chunk_num;
+  char data[B2FS_CHUNK_SIZE];
+} b2fs_file_chunk_t;
+
+typedef struct b2fs_file_entry {
+  bitmap_t *chunkmap;
+  keytree_t *chunks;
+  int readers, writers, size;
+} b2fs_file_entry_t;
 
 typedef struct b2fs_state {
   char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];

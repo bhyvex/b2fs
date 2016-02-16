@@ -4,7 +4,7 @@
 /*----- Numerical Constants -----*/
 
 #define HASH_START_SIZE 10
-#define HASH_SUCCESS 0x0
+#define HASH_SUCCESS 0x00
 #define HASH_FROZEN -0x01
 #define HASH_NOMEM -0x02
 #define HASH_INVAL -0x04

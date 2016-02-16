@@ -3,7 +3,7 @@
 
 /*----- Numerical Constants -----*/
 
-#define LIST_SUCCESS 0x0
+#define LIST_SUCCESS 0x00
 #define LIST_FROZEN -0x01
 #define LIST_NOMEM -0x02
 #define LIST_INVAL -0x04
