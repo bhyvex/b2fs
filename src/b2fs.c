@@ -76,7 +76,9 @@ void *b2fs_init(struct fuse_conn_info *info);
 void b2fs_destroy(void *userdata);
 int b2fs_getattr(const char *path, struct stat *statbuf);
 int b2fs_readlink(const char *path, char *buf, size_t size);
+int b2fs_opendir(const char *path, struct fuse_file_info *info);
 int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *info);
+int b2fs_releasedir(const char *path, struct fuse_file_info *info);
 int b2fs_mknod(const char *path, mode_t mode, dev_t rdev);
 int b2fs_mkdir(const char *path, mode_t mode);
 int b2fs_symlink(const char *from, const char *to);
@@ -94,6 +96,7 @@ int b2fs_write(const char *path, const char *buf, size_t size, off_t offset, str
 int b2fs_statfs(const char *path, struct statvfs *buf);
 int b2fs_release(const char *path, struct fuse_file_info *info);
 int b2fs_fsync(const char *path, int crap, struct fuse_file_info *info);
+int b2fs_flush(const char *path, struct fuse_file_info *info);
 int b2fs_access(const char *path, int mode);
 
 // Network Functions.
@@ -126,7 +129,9 @@ int main(int argc, char **argv) {
   struct fuse_operations mappings = {
     .getattr    = b2fs_getattr,
     .readlink   = b2fs_readlink,
+    .opendir    = b2fs_opendir,
     .readdir    = b2fs_readdir,
+    .releasedir = b2fs_releasedir,
     .mknod      = b2fs_mknod,
     .mkdir      = b2fs_mkdir,
     .unlink     = b2fs_unlink,
@@ -143,6 +148,7 @@ int main(int argc, char **argv) {
     .statfs     = b2fs_statfs,
     .release    = b2fs_release,
     .fsync      = b2fs_fsync,
+    .flush      = b2fs_flush,
     .access     = b2fs_access
   };
 
@@ -197,6 +203,14 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
 }
 
 int b2fs_readlink(const char *path, char *buf, size_t size) {
+  (void) path;
+  (void) buf;
+  (void) size;
+  return -ENOTSUP;
+}
+
+// TODO: Implement this function.
+int b2fs_opendir(const char *path, struct fuse_file_info *info) {
   return -ENOTSUP;
 }
 
@@ -205,6 +219,12 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
   return -ENOTSUP;
 }
 
+// TODO: Implement this function.
+int b2fs_releasedir(const char *path, struct fuse_file_info *info) {
+  return -ENOTSUP;
+}
+
+// TODO: Implement this function.
 int b2fs_mknod(const char *path, mode_t mode, dev_t rdev) {
   return -ENOTSUP;
 }
@@ -215,6 +235,8 @@ int b2fs_mkdir(const char *path, mode_t mode) {
 }
 
 int b2fs_symlink(const char *from, const char *to) {
+  (void) from;
+  (void) to;
   return -ENOTSUP;
 }
 
@@ -234,14 +256,21 @@ int b2fs_rename(const char *from, const char *to) {
 }
 
 int b2fs_link(const char *from, const char *to) {
+  (void) from;
+  (void) to;
   return -ENOTSUP;
 }
 
 int b2fs_chmod(const char *path, mode_t mode) {
+  (void) path;
+  (void) mode;
   return -ENOTSUP;
 }
 
 int b2fs_chown(const char *path, uid_t uid, gid_t gid) {
+  (void) path;
+  (void) uid;
+  (void) gid;
   return -ENOTSUP;
 }
 
@@ -251,6 +280,8 @@ int b2fs_truncate(const char *path, off_t size) {
 }
 
 int b2fs_utime(const char *path, struct utimbuf *buf) {
+  (void) path;
+  (void) buf;
   return -ENOTSUP;
 }
 
@@ -279,11 +310,19 @@ int b2fs_release(const char *path, struct fuse_file_info *info) {
   return -ENOTSUP;
 }
 
+// TODO: Implement this function.
 int b2fs_fsync(const char *path, int crap, struct fuse_file_info *info) {
   return -ENOTSUP;
 }
 
+// TODO: Implement this function.
+int b2fs_flush(const char *path, struct fuse_file_info *info) {
+  return -ENOTSUP;
+}
+
 int b2fs_access(const char *path, int mode) {
+  (void) path;
+  (void) mode;
   return -ENOTSUP;
 }
 
