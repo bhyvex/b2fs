@@ -74,6 +74,8 @@ int init_hash(hash_t *table, void (*destruct) (void *)) {
 }
 
 // Function handles creation of a hash value for a given string.
+// FIXME: Really need to replace this with some sort of competent
+// hashing function like xxhash.
 int hash_key(char *key, int size) {
   int proto_hash = 0;
   for (unsigned int i = 0; i < strlen(key); i++) {

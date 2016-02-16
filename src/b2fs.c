@@ -35,6 +35,7 @@
 
 #include "b64/cencode.h"
 #include "jsmn/jsmn.h"
+#include "structures/hash.h"
 
 /*----- Macro Declarations -----*/
 
@@ -75,11 +76,11 @@ typedef struct b2_account {
   char app_key[B2FS_APP_KEY_LEN];
 } b2_account_t;
 
-typedef struct b2_auth {
-  char token[B2FS_TOKEN_LEN];
-  char api_url[B2FS_TOKEN_LEN];
-  char down_url[B2FS_TOKEN_LEN];
-} b2_auth_t;
+typedef struct b2fs_state {
+  char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];
+  char down_url[B2FS_TOKEN_LEN], bucket[B2FS_SMALL_GENERIC_BUFFER];
+  hash_t *fs_cache;
+} b2fs_state_t;
 
 typedef enum b2fs_loglevel {
   LEVEL_DEBUG,
@@ -122,10 +123,10 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
 
 // Helper Functions.
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
-void cache_auth(b2_auth_t *auth_info);
-int find_cached_auth(b2_auth_t *auth_info);
+void cache_auth(b2fs_state_t *b2_info);
+int find_cached_auth(b2fs_state_t *b2_info);
 int parse_config(b2_account_t *auth, char *config_file);
-int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info);
+int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info);
 void find_tmpdir(char **out);
 void print_usage(int intentional);
 
@@ -134,9 +135,10 @@ void print_usage(int intentional);
 int main(int argc, char **argv) {
   int c, index, retval;
   b2_account_t account;
-  b2_auth_t auth_info;
-  char *config = "b2fs.yml", *mount_point = NULL;
+  b2fs_state_t b2_info;
+  char *config = "b2fs.yml", *mount_point = NULL, *bucket = NULL;
   struct option long_options[] = {
+    {"bucket", required_argument, 0, 'b'},
     {"config", required_argument, 0, 'c'},
     {"mount", required_argument, 0, 'm'},
     {0, 0, 0, 0}
@@ -172,6 +174,9 @@ int main(int argc, char **argv) {
   // Get CLI options.
   while ((c = getopt_long(argc, argv, "c:m:", long_options, &index)) != -1) {
     switch (c) {
+      case 'b':
+        bucket = optarg;
+        break;
       case 'c':
         config = optarg;
         break;
@@ -182,14 +187,17 @@ int main(int argc, char **argv) {
         print_usage(0);
     }
   }
-  if (!mount_point) {
-    write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mountpoint.\n");
+  if (!mount_point || !bucket) {
+    write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mountpoint and bucket.\n");
+    print_usage(0);
+  } else if (strlen(bucket) > B2FS_SMALL_GENERIC_BUFFER - 1) {
+    write_log(LEVEL_ERROR, "B2FS: Bucket name too long. Max length is %d.\n", B2FS_SMALL_GENERIC_BUFFER);
     print_usage(0);
   }
   curl_global_init(CURL_GLOBAL_DEFAULT);
 
   // Check if we have a cached API key.
-  retval = find_cached_auth(&auth_info);
+  retval = find_cached_auth(&b2_info);
 
   // Get account information from the config file if not cached.
   if (retval && parse_config(&account, config)) {
@@ -198,7 +206,7 @@ int main(int argc, char **argv) {
 
   if (retval) {
     // Attempt to grab authentication token from B2.
-    retval = attempt_authentication(&account, &auth_info);
+    retval = attempt_authentication(&account, &b2_info);
 
     // Check response.
     if (retval == B2FS_NETWORK_ACCESS_ERROR) {
@@ -206,10 +214,10 @@ int main(int argc, char **argv) {
     } else if (retval == B2FS_NETWORK_API_ERROR) {
       write_log(LEVEL_ERROR, "B2FS: BackBlaze API has changed. B2FS will not work without an update.\n");
     } else if (retval == B2FS_NETWORK_INTERN_ERROR) {
-      write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", auth_info.token);
+      write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", b2_info.token);
       write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
     } else if (retval == B2FS_GENERIC_NETWORK_ERROR) {
-      write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", auth_info.token);
+      write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", b2_info.token);
       write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n");
     } else if (retval == B2FS_GENERIC_ERROR) {
       write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
@@ -217,12 +225,13 @@ int main(int argc, char **argv) {
     if (retval != B2FS_SUCCESS) exit(EXIT_FAILURE);
 
     // Cache new auth info.
-    cache_auth(&auth_info);
+    cache_auth(&b2_info);
   }
 
   // We are authenticated and have a valid token. Start up FUSE.
+  strcpy(b2_info.bucket, bucket);
   argv[0] = mount_point;
-  return fuse_main(1, argv, &mappings, &auth_info);
+  return fuse_main(1, argv, &mappings, &b2_info);
 }
 
 // TODO: Implement this function.
@@ -386,7 +395,7 @@ int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
   return 1;
 }
 
-void cache_auth(b2_auth_t *auth_info) {
+void cache_auth(b2fs_state_t *b2_info) {
   char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
 
   // Locate system tmpdir if possible.
@@ -399,14 +408,14 @@ void cache_auth(b2_auth_t *auth_info) {
 
   // Write it out.
   if (cache_out) {
-    fprintf(cache_out, "%s\n%s\n%s", auth_info->token, auth_info->api_url, auth_info->down_url);
+    fprintf(cache_out, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
     fclose(cache_out);
   }
 }
 
-int find_cached_auth(b2_auth_t *auth_info) {
+int find_cached_auth(b2fs_state_t *b2_info) {
   char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
-  memset(auth_info, 0, sizeof(b2_auth_t));
+  memset(b2_info, 0, sizeof(b2fs_state_t));
 
   // Locate system tmpdir if possible.
   find_tmpdir(&tmpdir);
@@ -419,8 +428,8 @@ int find_cached_auth(b2_auth_t *auth_info) {
   // Read the cached info in.
   if (cache_in) {
     int success;
-    fscanf(cache_in, "%s\n%s\n%s", auth_info->token, auth_info->api_url, auth_info->down_url);
-    success = strlen(auth_info->token) && strlen(auth_info->api_url) && strlen(auth_info->down_url);
+    fscanf(cache_in, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
+    success = strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url);
     return success ? B2FS_SUCCESS : B2FS_GENERIC_ERROR;
   } else {
     return B2FS_GENERIC_ERROR;
@@ -450,7 +459,7 @@ int parse_config(b2_account_t *auth, char *config_file) {
   }
 }
 
-int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
+int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
   CURL *curl;
   CURLcode res;
 
@@ -502,17 +511,17 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
         }
 
         // Iterate over returned tokens and extract the needed info.
-        memset(auth_info, 0, sizeof(b2_auth_t));
+        memset(b2_info, 0, sizeof(b2fs_state_t));
         for (int i = 1; i < token_count; i++) {
           jsmntok_t *key = &tokens[i++], *value = &tokens[i];
           int len = value->end - value->start;
 
           if (jsmn_iskey(data, key, "authorizationToken")) {
-            memcpy(auth_info->token, data + value->start, len);
+            memcpy(b2_info->token, data + value->start, len);
           } else if (jsmn_iskey(data, key, "apiUrl")) {
-            memcpy(auth_info->api_url, data + value->start, len);
+            memcpy(b2_info->api_url, data + value->start, len);
           } else if (jsmn_iskey(data, key, "downloadUrl")) {
-            memcpy(auth_info->down_url, data + value->start, len);
+            memcpy(b2_info->down_url, data + value->start, len);
           } else if (!jsmn_iskey(data, key, "accountId")) {
             LOG_KEY(data, key, "authentication");
           }
@@ -520,7 +529,7 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
         free(data);
 
         // Validate and return!
-        if (strlen(auth_info->token) && strlen(auth_info->api_url) && strlen(auth_info->down_url)) {
+        if (strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url)) {
           return B2FS_SUCCESS;
         } else {
           return B2FS_NETWORK_API_ERROR;
@@ -531,8 +540,8 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
         return B2FS_NETWORK_ACCESS_ERROR;
       } else {
         // Request was badly formatted. Denotes an internal error.
-        strncpy(auth_info->token, data, B2FS_TOKEN_LEN - 1);
-        auth_info->token[B2FS_TOKEN_LEN - 1] = '\0';
+        strncpy(b2_info->token, data, B2FS_TOKEN_LEN - 1);
+        b2_info->token[B2FS_TOKEN_LEN - 1] = '\0';
         free(data);
         return B2FS_NETWORK_INTERN_ERROR;
       }
@@ -540,8 +549,8 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
     } else {
       // cURL error encountered. Don't know enough about this to predict why.
       // FIXME: Maybe add more detailed error handling here.
-      strncpy(auth_info->token, curl_easy_strerror(res), B2FS_TOKEN_LEN - 1);
-      auth_info->token[B2FS_TOKEN_LEN - 1] = '\0';
+      strncpy(b2_info->token, curl_easy_strerror(res), B2FS_TOKEN_LEN - 1);
+      b2_info->token[B2FS_TOKEN_LEN - 1] = '\0';
       curl_easy_cleanup(curl);
       return B2FS_GENERIC_NETWORK_ERROR;
     }
