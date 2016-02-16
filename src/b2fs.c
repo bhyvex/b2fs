@@ -16,8 +16,6 @@
 #define B2FS_MED_GENERIC_BUFFER 1024
 #define B2FS_LARGE_GENERIC_BUFFER 4096
 
-// So the preprocessor won't complain.
-#undef FUSE_USE_VERSION
 #define FUSE_USE_VERSION 30
 
 /*----- System Includes -----*/
@@ -123,8 +121,11 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
 
 // Helper Functions.
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
+void cache_auth(b2_auth_t *auth_info);
+int find_cached_auth(b2_auth_t *auth_info);
 int parse_config(b2_account_t *auth, char *config_file);
 int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info);
+void find_tmpdir(char **out);
 void print_usage(int intentional);
 
 /*----- Local Function Implementations -----*/
@@ -184,29 +185,39 @@ int main(int argc, char **argv) {
     write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mountpoint.\n");
     print_usage(0);
   }
+  curl_global_init(CURL_GLOBAL_DEFAULT);
 
-  // Get account information from the config file.
-  if (parse_config(&account, config)) {
+  // Check if we have a cached API key.
+  retval = find_cached_auth(&auth_info);
+
+  // Get account information from the config file if not cached.
+  if (retval && parse_config(&account, config)) {
     write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
   }
 
-  // Attempt to grab authentication token from B2.
-  curl_global_init(CURL_GLOBAL_DEFAULT);
-  retval = attempt_authentication(&account, &auth_info);
-  if (retval == B2FS_NETWORK_ACCESS_ERROR) {
-    write_log(LEVEL_ERROR, "B2FS: Authentication failed. Credentials are invalid.\n");
-  } else if (retval == B2FS_NETWORK_API_ERROR) {
-    write_log(LEVEL_ERROR, "B2FS: BackBlaze API has changed. B2FS will not work without an update.\n");
-  } else if (retval == B2FS_NETWORK_INTERN_ERROR) {
-    write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", auth_info.token);
-    write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
-  } else if (retval == B2FS_GENERIC_NETWORK_ERROR) {
-    write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", auth_info.token);
-    write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n");
-  } else if (retval == B2FS_GENERIC_ERROR) {
-    write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
+  if (retval) {
+    // Attempt to grab authentication token from B2.
+    retval = attempt_authentication(&account, &auth_info);
+
+    // Check response.
+    if (retval == B2FS_NETWORK_ACCESS_ERROR) {
+      write_log(LEVEL_ERROR, "B2FS: Authentication failed. Credentials are invalid.\n");
+    } else if (retval == B2FS_NETWORK_API_ERROR) {
+      write_log(LEVEL_ERROR, "B2FS: BackBlaze API has changed. B2FS will not work without an update.\n");
+    } else if (retval == B2FS_NETWORK_INTERN_ERROR) {
+      write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", auth_info.token);
+      write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
+    } else if (retval == B2FS_GENERIC_NETWORK_ERROR) {
+      write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", auth_info.token);
+      write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n");
+    } else if (retval == B2FS_GENERIC_ERROR) {
+      write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
+    }
+    if (retval != B2FS_SUCCESS) exit(EXIT_FAILURE);
+
+    // Cache new auth info.
+    cache_auth(&auth_info);
   }
-  if (retval != B2FS_SUCCESS) exit(EXIT_FAILURE);
 
   // We are authenticated and have a valid token. Start up FUSE.
   argv[0] = mount_point;
@@ -215,6 +226,7 @@ int main(int argc, char **argv) {
 
 // TODO: Implement this function.
 void *b2fs_init(struct fuse_conn_info *info) {
+
   return NULL;
 }
 
@@ -373,6 +385,47 @@ int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
   return 1;
 }
 
+void cache_auth(b2_auth_t *auth_info) {
+  char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
+
+  // Locate system tmpdir if possible.
+  find_tmpdir(&tmpdir);
+  if (!tmpdir) return;
+
+  // Open cache file.
+  sprintf(path, "%s/b2fs_cache.txt", tmpdir);
+  FILE *cache_out = fopen(path, "w+");
+
+  // Write it out.
+  if (cache_out) {
+    fprintf(cache_out, "%s\n%s\n%s", auth_info->token, auth_info->api_url, auth_info->down_url);
+    fclose(cache_out);
+  }
+}
+
+int find_cached_auth(b2_auth_t *auth_info) {
+  char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
+  memset(auth_info, 0, sizeof(b2_auth_t));
+
+  // Locate system tmpdir if possible.
+  find_tmpdir(&tmpdir);
+  if (!tmpdir) return B2FS_GENERIC_ERROR;
+
+  // Open cache file.
+  sprintf(path, "%s/b2fs_cache.txt", tmpdir);
+  FILE *cache_in = fopen(path, "r");
+
+  // Read the cached info in.
+  if (cache_in) {
+    int success;
+    fscanf(cache_in, "%s\n%s\n%s", auth_info->token, auth_info->api_url, auth_info->down_url);
+    success = strlen(auth_info->token) && strlen(auth_info->api_url) && strlen(auth_info->down_url);
+    return success ? B2FS_SUCCESS : B2FS_GENERIC_ERROR;
+  } else {
+    return B2FS_GENERIC_ERROR;
+  }
+}
+
 int parse_config(b2_account_t *auth, char *config_file) {
   FILE *config = fopen(config_file, "r");
   char keybuf[B2FS_SMALL_GENERIC_BUFFER], valbuf[B2FS_SMALL_GENERIC_BUFFER];
@@ -405,7 +458,7 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
     char *url = "https://api.backblaze.com/b2api/v1/b2_authorize_account";
     char conversionbuf[B2FS_SMALL_GENERIC_BUFFER], based[B2FS_SMALL_GENERIC_BUFFER], final[B2FS_SMALL_GENERIC_BUFFER];
     char *tmp = based, *data = NULL;
-    
+
     // Set URL for request.
     curl_easy_setopt(curl, CURLOPT_URL, url);
 
@@ -458,14 +511,14 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
             memcpy(auth_info->api_url, data + value->start, len);
           } else if (jsmn_iskey(data, key, "downloadUrl")) {
             memcpy(auth_info->down_url, data + value->start, len);
-          } else {
+          } else if (!jsmn_iskey(data, key, "accountId")) {
             LOG_KEY(data, key, "authentication");
           }
         }
         free(data);
 
         // Validate and return!
-        if (strlen(auth_info->token) > 0 && strlen(auth_info->api_url) > 0 && strlen(auth_info->down_url) > 0) {
+        if (strlen(auth_info->token) && strlen(auth_info->api_url) && strlen(auth_info->down_url)) {
           return B2FS_SUCCESS;
         } else {
           return B2FS_NETWORK_API_ERROR;
@@ -492,6 +545,23 @@ int attempt_authentication(b2_account_t *auth, b2_auth_t *auth_info) {
   } else {
     return B2FS_GENERIC_ERROR;
   }
+}
+
+void find_tmpdir(char **out) {
+  static char *fallback = "/tmp";
+  char *tmpdir = NULL;
+
+  *out = NULL;
+  tmpdir = getenv("TMPDIR");
+  if (tmpdir && !*out) *out = tmpdir;
+  tmpdir = getenv("TMP");
+  if (tmpdir && !*out) *out = tmpdir;
+  tmpdir = getenv("TEMP");
+  if (tmpdir && !*out) *out = tmpdir;
+  tmpdir = getenv("TEMPDIR");
+  if (tmpdir && !*out) *out = tmpdir;
+
+  if (!*out && !access("/tmp", R_OK)) *out = fallback;
 }
 
 void print_usage(int intentional) {
