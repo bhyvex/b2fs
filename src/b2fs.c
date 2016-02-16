@@ -153,12 +153,14 @@ int main(int argc, char **argv) {
   };
 
   // Get CLI options.
-  while ((c = getopt_long(argc, argv, "c:", long_options, &index))) {
+  while ((c = getopt_long(argc, argv, "c:m:", long_options, &index)) != -1) {
     switch (c) {
       case 'c':
         config = optarg;
+        break;
       case 'm':
         mount_point = optarg;
+        break;
       default:
         print_usage(0);
     }
