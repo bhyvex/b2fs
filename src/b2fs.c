@@ -7,7 +7,9 @@
 
 #define B2FS_ACCOUNT_ID_LEN 16
 #define B2FS_APP_KEY_LEN 64
-#define B2FS_SMALL_GENERIC_BUFFER 128
+#define B2FS_SMALL_GENERIC_BUFFER 256
+#define B2FS_MED_GENERIC_BUFFER 1024
+#define B2FS_LARGE_GENERIC_BUFFER 4096
 
 // So the preprocessor won't complain.
 #undef FUSE_USE_VERSION
@@ -118,7 +120,7 @@ const char *base = "https://api.backblaze.com/b2api/v1";
 int main(int argc, char **argv) {
   int c, index, retval;
   b2_authentication_t auth;
-  char *config = "b2fs.yml", *mount_point = NULL, auth_token[B2FS_SMALL_GENERIC_BUFFER], *fuse_args;
+  char *config = "b2fs.yml", *mount_point = NULL, auth_token[B2FS_LARGE_GENERIC_BUFFER], *fuse_args;
   struct option long_options[] = {
     {"config", required_argument, 0, 'c'},
     {"mount", required_argument, 0, 'm'},
@@ -330,10 +332,16 @@ int b2fs_access(const char *path, int mode) {
 
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
   char *recvbuf = malloc(sizeof(char) * ((size * nmembers) + 1));
-  char **output = voidarg;
-  memcpy(recvbuf, data, size * nmembers);
-  *(recvbuf + (size * nmembers)) = '\0';
-  *output = recvbuf;
+
+  if (recvbuf) {
+    char **output = voidarg;
+    memcpy(recvbuf, data, size * nmembers);
+    *(recvbuf + (size * nmembers)) = '\0';
+    *output = recvbuf;
+    return size * nmembers;
+  } else {
+    return 0;
+  }
 }
 
 int parse_config(b2_authentication_t *auth, char *config_file) {
@@ -343,11 +351,11 @@ int parse_config(b2_authentication_t *auth, char *config_file) {
 
   if (config) {
     for (int i = 0; i < 2; i++) {
-      fscanf(config, "%s: %s\n", keybuf, valbuf);
+      fscanf(config, "%s %s\n", keybuf, valbuf);
 
-      if (!strcmp(keybuf, "account_id")) {
+      if (!strcmp(keybuf, "account_id:")) {
         strcpy(auth->account_id, valbuf);
-      } else if (!strcmp(keybuf, "app_key")) {
+      } else if (!strcmp(keybuf, "app_key:")) {
         strcpy(auth->app_key, valbuf);
       } else {
         write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
@@ -379,7 +387,7 @@ int attempt_authentication(b2_authentication_t *auth, char *auth_token) {
     sprintf(conversionbuf, "%s:%s", auth->account_id, auth->app_key);
     tmp += base64_encode_block(conversionbuf, strlen(conversionbuf), tmp, &state);
     tmp += base64_encode_blockend(tmp, &state);
-    *tmp = '\0';
+    *(--tmp) = '\0';
     sprintf(final, "Authorization: Basic %s", based);
 
     // Setup custom headers.
@@ -394,7 +402,7 @@ int attempt_authentication(b2_authentication_t *auth, char *auth_token) {
     // Attempt authentication.
     if ((res = curl_easy_perform(curl)) == CURLE_OK) {
       // Copy data into output buffer and return.
-      assert(strlen(data) < B2FS_SMALL_GENERIC_BUFFER);
+      assert(strlen(data) < B2FS_LARGE_GENERIC_BUFFER);
       strcpy(auth_token, data);
       return B2FS_SUCCESS;
     } else {
