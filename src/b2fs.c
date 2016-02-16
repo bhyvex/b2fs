@@ -3,7 +3,8 @@
 #define B2FS_SUCCESS 0x00
 #define B2FS_GENERIC_ERROR -0x01
 #define B2FS_GENERIC_NETWORK_ERROR -0x02
-#define B2FS_NOMEM -0x04
+#define B2FS_NETWORK_ACCESS_ERROR -0x0100
+#define B2FS_NETWORK_INTERN_ERROR -0x0101
 
 #define B2FS_ACCOUNT_ID_LEN 16
 #define B2FS_APP_KEY_LEN 64
@@ -120,7 +121,7 @@ const char *base = "https://api.backblaze.com/b2api/v1";
 int main(int argc, char **argv) {
   int c, index, retval;
   b2_authentication_t auth;
-  char *config = "b2fs.yml", *mount_point = NULL, auth_token[B2FS_LARGE_GENERIC_BUFFER], *fuse_args;
+  char *config = "b2fs.yml", *mount_point = NULL, auth_token[B2FS_SMALL_GENERIC_BUFFER], *fuse_args;
   struct option long_options[] = {
     {"config", required_argument, 0, 'c'},
     {"mount", required_argument, 0, 'm'},
@@ -180,11 +181,18 @@ int main(int argc, char **argv) {
   // Attempt to grab authentication token from B2.
   curl_global_init(CURL_GLOBAL_DEFAULT);
   retval = attempt_authentication(&auth, auth_token);
-  if (retval == B2FS_GENERIC_NETWORK_ERROR) {
-    write_log(LEVEL_ERROR, "B2FS: Authentication failed. Given reason: %s\n", auth_token);
+  if (retval == B2FS_NETWORK_ACCESS_ERROR) {
+    write_log(LEVEL_ERROR, "B2FS: Authentication failed. Credentials are invalid.\n");
+  } else if (retval == B2FS_NETWORK_INTERN_ERROR) {
+    write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", auth_token);
+    write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
+  } else if (retval == B2FS_GENERIC_NETWORK_ERROR) {
+    write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", auth_token);
+    write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n", auth_token);
   } else if (retval == B2FS_GENERIC_ERROR) {
     write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
   }
+  if (retval != B2FS_SUCCESS) exit(EXIT_FAILURE);
 
   // We are authenticated and have a valid token. Start up FUSE.
   argv[0] = mount_point;
@@ -401,12 +409,30 @@ int attempt_authentication(b2_authentication_t *auth, char *auth_token) {
 
     // Attempt authentication.
     if ((res = curl_easy_perform(curl)) == CURLE_OK) {
-      // Copy data into output buffer and return.
-      assert(strlen(data) < B2FS_LARGE_GENERIC_BUFFER);
-      strcpy(auth_token, data);
+      // No cURL errors occured, time to check for HTTP errors...
+      long code;
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+      if (code == 200) {
+        // Our authentication request went through. Time to JSON parse.
+
+      } else if (code == 401) {
+        // Our authentication request was rejected due to bad auth info.
+        free(data);
+        return B2FS_NETWORK_ACCESS_ERROR;
+      } else {
+        // Request was badly formatted. Denotes an internal error.
+        strncpy(auth_token, data, B2FS_SMALL_GENERIC_BUFFER - 1);
+        auth_token[B2FS_SMALL_GENERIC_BUFFER - 1] = '\0';
+        free(data);
+        return B2FS_NETWORK_INTERN_ERROR;
+      }
       return B2FS_SUCCESS;
     } else {
-      strcpy(auth_token, curl_easy_strerror(res));
+      // cURL error encountered. Don't know enough about this to predict why.
+      // FIXME: Maybe add more detailed error handling here.
+      strncpy(auth_token, curl_easy_strerror(res), B2FS_SMALL_GENERIC_BUFFER - 1);
+      auth_token[B2FS_SMALL_GENERIC_BUFFER - 1] = '\0';
       return B2FS_GENERIC_NETWORK_ERROR;
     }
   } else {
