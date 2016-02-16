@@ -1,5 +1,5 @@
 CC				= gcc
-CFLAGS		= -g -std=gnu99 -D_FILE_OFFSET_BITS=64
+CFLAGS		= -g -Wall -std=gnu99 -D_FILE_OFFSET_BITS=64
 LDFLAGS		= -lpthread -lfuse -lcurl
 LIBB64		= $(wildcard src/b64/*.c)
 JSMN			= $(wildcard src/jsmn/*.c)
