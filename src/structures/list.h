@@ -16,8 +16,9 @@ typedef struct list list_t;
 /*----- Function Declarations -----*/
 
 list_t *create_list(int elem_len, void (*destruct) (void *));
-int init_list(list_t *lst, int elem_len, void (*destruct) (void *));
 int lpush(list_t *lst, void *data);
+int rpush(list_t *lst, void *data);
+int lpop(list_t *lst, void *buf);
 int rpop(list_t *lst, void *buf);
 void destroy_list(list_t *lst);
 
