@@ -31,6 +31,11 @@ int stack_pop(stack_t *stack, void *buf) {
   else return STACK_SUCCESS;
 }
 
+void *stack_peek(stack_t *stack) {
+  if (!stack) return NULL;
+  return lhead(stack->lst);
+}
+
 void destroy_stack(stack_t *stack) {
   destroy_list(stack->lst);
   free(stack);

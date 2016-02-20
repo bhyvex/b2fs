@@ -137,6 +137,18 @@ int intern_pop(list_t *lst, void *buf, int left) {
   return LIST_SUCCESS;
 }
 
+void *lhead(list_t *lst) {
+  if (!lst) return NULL;
+  else if (!lst->head) return NULL;
+  return lst->head->data;
+}
+
+void *ltail(list_t *lst) {
+  if (!lst) return NULL;
+  else if (!lst->tail) return NULL;
+  return lst->tail->data;
+}
+
 // Function is responsible for destroying a list.
 void destroy_list(list_t *lst) {
   if (!lst) return;

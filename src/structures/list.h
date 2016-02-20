@@ -20,6 +20,8 @@ int lpush(list_t *lst, void *data);
 int rpush(list_t *lst, void *data);
 int lpop(list_t *lst, void *buf);
 int rpop(list_t *lst, void *buf);
+void *lhead(list_t *lst);
+void *ltail(list_t *lst);
 void destroy_list(list_t *lst);
 
 #endif
