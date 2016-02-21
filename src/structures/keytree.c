@@ -36,10 +36,11 @@ stack_t *internal_traverse(keytree_t *tree, void *key, int acquire);
 tree_node_t *balance(tree_node_t *subtree);
 tree_node_t *rotate_right(tree_node_t *subtree);
 tree_node_t *rotate_left(tree_node_t *subtree);
+void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *));
 int subtree_height(tree_node_t *subtree);
 tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize);
 void dereference_and_destroy(void *voidarg);
-void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *));
+void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *), int release);
 
 /*----- Function Implementations -----*/
 
@@ -79,6 +80,8 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
   pthread_rwlock_unlock(&tree->lock);
 
   // Spin and traverse until we lock the insertion point.
+  // This whole dance is necessary so that we can avoid acquiring the write-lock
+  // for as long as possible.
   stack_t *stack;
   tree_node_t *current;
   while (1) {
@@ -144,7 +147,8 @@ int keytree_find(keytree_t *tree, void *key, void *valbuf) {
     memcpy(valbuf, target->value, tree->valsize);
     success = 1;
   }
-  pthread_rwlock_unlock(&tree->lock);
+
+  // Release our references.
   destroy_stack(stack);
 
   return success ? KEYTREE_SUCCESS : KEYTREE_NO_SUCH_ELEMENT;
@@ -292,16 +296,19 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       // Oh Jesus. We're done. Talk about an exhausting function. Clean up and return.
       destroy_stack(stack);
 
+      // Copy the data out if the user gave us somewhere to do it.
+      if (valbuf) memcpy(valbuf, removed->value, tree->valsize);
+
       // Note that this will block until all other references to the node have been
       // released, and that it will also release the write-lock.
-      destroy_tree_node(removed, &tree->lock, tree->key_destroy, tree->val_destroy);
+      destroy_tree_node(removed, &tree->lock, tree->key_destroy, tree->val_destroy, 1);
       return KEYTREE_SUCCESS;
     } else {
       // We are a follower...
       // Nothing left to do. Leave removal up to leader (may already be done).
       destroy_stack(stack);
       pthread_rwlock_unlock(&tree->lock);
-      return KEYTREE_SUCCESS;
+      return KEYTREE_NO_SUCH_ELEMENT;
     }
   } else {
     // The element doesn't exist in the tree.
@@ -313,7 +320,17 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
 
 // Function destroys a KeyTree, obviously.
 void keytree_destroy(keytree_t *tree) {
+  // No point in worrying about performance here. Just grab the write-lock at the
+  // outset.
+  pthread_rwlock_wrlock(&tree->lock);
 
+  // Function waits for each nodes' references to reach zero, destroys them, and
+  // returns.
+  inorder_destruction(tree->root, &tree->lock, tree->key_destroy, tree->val_destroy);
+  pthread_rwlock_unlock(&tree->lock);
+
+  // Finish up.
+  free(tree);
 }
 
 // Tree helper functions.
@@ -365,22 +382,31 @@ tree_node_t *balance(tree_node_t *subtree) {
   subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
 }
 
-tree_node_t *rotate_right(tree_node_t *node) {
-  tree_node_t *right_child = node->right;
-  node->right = right_child->left;
-  right_child->left = node;
-  node->height = MAX(subtree_height(node->left), subtree_height(node->right)) + 1;
-  right_child->height = MAX(subtree_height(right_child->right), node->height) + 1;
+tree_node_t *rotate_right(tree_node_t *subtree) {
+  tree_node_t *right_child = subtree->right;
+  subtree->right = right_child->left;
+  right_child->left = subtree;
+  subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
+  right_child->height = MAX(subtree_height(right_child->right), subtree->height) + 1;
   return right_child;
 }
 
-tree_node_t *rotate_left(tree_node_t *node) {
-  tree_node_t *left_child = node->left;
-  node->left = left_child->right;
-  left_child->right = node;
-  node->height = MAX(subtree_height(node->left), subtree_height(node->right)) + 1;
-  left_child->height = MAX(subtree_height(left_child->left), node->height);
+tree_node_t *rotate_left(tree_node_t *subtree) {
+  tree_node_t *left_child = subtree->left;
+  subtree->left = left_child->right;
+  left_child->right = subtree;
+  subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
+  left_child->height = MAX(subtree_height(left_child->left), subtree->height);
   return left_child;
+}
+
+void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
+  if (!subtree) return;
+
+  tree_node_t *left_subtree = subtree->left, *right_subtree = subtree->right;
+  inorder_destruction(left_subtree, lock, key_destroy, val_destroy);
+  destroy_tree_node(subtree, lock, key_destroy, val_destroy, 0);
+  inorder_destruction(right_subtree, lock, key_destroy, val_destroy);
 }
 
 int subtree_height(tree_node_t *node) {
@@ -412,7 +438,7 @@ void dereference_and_destroy(void *voidarg) {
 // Function takes care of destroying a tree node.
 // Function blocks until node references hit 0.
 // Function expects wrlock to be held when called.
-void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
+void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *), int release) {
   struct timespec ts;
   for (int i = 0; node->references; i++) {
     pthread_rwlock_unlock(lock);
@@ -433,5 +459,5 @@ void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_des
   free(node);
 
   // We're done. Unlock and return.
-  pthread_rwlock_unlock(lock);
+  if (release) pthread_rwlock_unlock(lock);
 }
