@@ -12,12 +12,20 @@ typedef struct list_node {
   struct list_node *next, *prev;
 } list_node_t;
 
-typedef struct list {
+// FIXME: Need to update these files. Use of a generic mutex is wasteful in this
+// instance. Should use a pthread_rwlock_t;
+struct list {
   list_node_t *head, *tail;
   int count, dynamic, frozen, elem_len;
   pthread_mutex_t mutex;
   void (*destruct) (void *);
-} list_t;
+};
+
+struct list_iterator {
+  list_node_t *next, *prev;
+  pthread_mutex_t *lock;
+  int elem_len;
+};
 
 /*----- Internal Function Declarations -----*/
 
@@ -147,6 +155,68 @@ void *ltail(list_t *lst) {
   if (!lst) return NULL;
   else if (!lst->tail) return NULL;
   return lst->tail->data;
+}
+
+list_iterator_t *literate_start(list_t *lst) {
+  if (!lst) return NULL;
+
+  list_iterator_t *it = malloc(sizeof(list_iterator_t));
+  pthread_mutex_lock(&lst->mutex);
+  if (it) {
+    it->next = lst->head;
+    it->prev = NULL;
+    it->elem_len = lst->elem_len;
+    it->lock = &lst->mutex;
+  }
+  pthread_mutex_unlock(&lst->mutex);
+
+  return it;
+}
+
+// FIXME: This function is naive. It's possible for the node it's iterating
+// across to be removed from the list and freed. Need to resolve this eventually.
+int literate_forward(list_iterator_t *it, void *voidbuf) {
+  if (!it) return LIST_INVAL;
+
+  pthread_mutex_lock(it->lock);
+  if (it->next) {
+    list_node_t *next = it->next;
+    memcpy(voidbuf, next->data, it->elem_len);
+    it->next = next->next;
+    it->prev = next->prev;
+    pthread_mutex_unlock(it->lock);
+    return LIST_SUCCESS;
+  } else {
+    pthread_mutex_unlock(it->lock);
+    return LIST_EMPTY;
+  }
+}
+
+// FIXME: This function is naive. It's possible for the node it's iterating
+// across to be removed from the list and freed. Need to resolve this eventually.
+int listerate_backward(list_iterator_t *it, void *voidbuf) {
+  if (!it) return LIST_INVAL;
+
+  pthread_mutex_lock(it->lock);
+  if (it->prev) {
+    list_node_t *prev = it->prev;
+    memcpy(voidbuf, prev->data, it->elem_len);
+    it->next = prev->next;
+    it->prev = prev->prev;
+    pthread_mutex_unlock(it->lock);
+    return LIST_SUCCESS;
+  } else {
+    pthread_mutex_unlock(it->lock);
+    return LIST_EMPTY;
+  }
+}
+
+void literate_stop(list_iterator_t *it) {
+  free(it);
+}
+
+int lelem_len(list_t *lst) {
+  return lst->elem_len;
 }
 
 // Function is responsible for destroying a list.

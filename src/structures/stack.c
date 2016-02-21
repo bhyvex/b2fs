@@ -36,6 +36,18 @@ void *stack_peek(stack_t *stack) {
   return lhead(stack->lst);
 }
 
+stack_t *dup_stack(stack_t *stack, void (*destruct) (void *)) {
+  stack_t *dup = create_stack(destruct, lelem_len(stack->lst));
+  char *voidbuf = malloc(lelem_len(stack->lst));
+
+  list_iterator_t *it = literate_start(stack->lst);
+  while (literate_forward(it, voidbuf) == LIST_SUCCESS) stack_push(dup, voidbuf);
+  literate_stop(it);
+
+  free(voidbuf);
+  return dup;
+}
+
 void destroy_stack(stack_t *stack) {
   destroy_list(stack->lst);
   free(stack);
