@@ -30,8 +30,8 @@ void *ltail(list_t *lst);
 
 // List Iterator Functions.
 list_iterator_t *literate_start(list_t *lst);
-int literate_forward(list_iterator_t *it, void *voidbuf);
-int listerate_backward(list_iterator_t *it, void *voidbuf);
+int literate_next(list_iterator_t *it, void *voidbuf);
+int literate_prev(list_iterator_t *it, void *voidbuf);
 void literate_stop(list_iterator_t *it);
 
 // Helper Functions.

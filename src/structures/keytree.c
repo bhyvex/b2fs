@@ -23,6 +23,12 @@ typedef struct tree_node {
   int height, references;
 } tree_node_t;
 
+struct keytree_iterator {
+  pthread_rwlock_t *lock;
+  tree_node_t *curr;
+  int keysize, valsize;
+};
+
 struct keytree {
   void (*key_destroy) (void *), (*val_destroy) (void *);
   int (*compare) (void *, void *), size, keysize, valsize;
@@ -62,6 +68,21 @@ keytree_t *create_keytree(void (*key_destroy) (void *), void (*val_destroy) (voi
   }
 
   return tree;
+}
+
+// Function destroys a KeyTree, obviously.
+void keytree_destroy(keytree_t *tree) {
+  // No point in worrying about performance here. Just grab the write-lock at the
+  // outset.
+  pthread_rwlock_wrlock(&tree->lock);
+
+  // Function waits for each nodes' references to reach zero, destroys them, and
+  // returns.
+  inorder_destruction(tree->root, &tree->lock, tree->key_destroy, tree->val_destroy);
+  pthread_rwlock_unlock(&tree->lock);
+
+  // Finish up.
+  free(tree);
 }
 
 // Function takes care of inserting a key-value pair into the tree.
@@ -318,19 +339,109 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
   }
 }
 
-// Function destroys a KeyTree, obviously.
-void keytree_destroy(keytree_t *tree) {
-  // No point in worrying about performance here. Just grab the write-lock at the
-  // outset.
-  pthread_rwlock_wrlock(&tree->lock);
+// Function allocates an interator and initializes it to the node with the given
+// key. If the given key does not exist, returns NULL.
+// If target key is NULL, initializes it to the smallest key.
+keytree_iterator_t *keytree_iterate_start(keytree_t *tree, void *target_key) {
+  if (!tree || !tree->root) return NULL;
+  keytree_iterator_t *it = malloc(sizeof(keytree_iterator_t));
 
-  // Function waits for each nodes' references to reach zero, destroys them, and
-  // returns.
-  inorder_destruction(tree->root, &tree->lock, tree->key_destroy, tree->val_destroy);
-  pthread_rwlock_unlock(&tree->lock);
+  if (it) {
+    // Copy over the data.
+    it->lock = &tree->lock;
 
-  // Finish up.
-  free(tree);
+    if (target_key) {
+      // Find the target node.
+      stack_t *stack = internal_traverse(tree, target_key, 1);
+
+      if (stack_pop(stack, &it->curr) == STACK_EMPTY) {
+        // Key does not exist in tree.
+        destroy_stack(stack);
+        pthread_rwlock_unlock(&tree->lock);
+        free(it);
+        return NULL;
+      }
+
+      // Key was successfully found.
+      destroy_stack(stack);
+    } else {
+      // User didn't provide a target key, find smallest node and start there.
+      pthread_rwlock_rdlock(&tree->lock);
+      tree_node_t *current = tree->root;
+      while (current->left) current = current->left;
+      it->curr = current;
+    }
+    // Increase reference count for the current node to make sure it isn't freed
+    // out from under us.
+    __sync_fetch_and_add(&it->curr->references, 1);
+
+    // Finish intializations.
+    it->keysize = tree->keysize;
+    it->valsize = tree->valsize;
+
+    // Unlock the tree.
+    pthread_rwlock_unlock(&tree->lock);
+  }
+
+  return it;
+}
+
+// Function copies data out for the current node, then moves forward.
+// FIXME: Could probably be done without locking. Reference counts should be enough to
+// protect access. Revisit.
+int keytree_iterate_next(keytree_iterator_t *it, void *keybuf, void *valbuf) {
+  if (!it) return KEYTREE_INVAL;
+  else if (!it->curr) return KEYTREE_NO_SUCH_ELEMENT;
+
+  // Lock the tree for reading.
+  pthread_rwlock_rdlock(it->lock);
+
+  // Copy the data into the buffers for the current node.
+  memcpy(keybuf, it->curr->key, it->keysize);
+  memcpy(valbuf, it->curr->value, it->valsize);
+
+  // Update references.
+  __sync_fetch_and_sub(&it->curr->references, 1);
+  if (it->curr->next) __sync_fetch_and_add(&it->curr->next->references, 1);
+
+  // Update pointers, unlock, and return.
+  it->curr = it->curr->next;
+  pthread_rwlock_unlock(it->lock);
+  return KEYTREE_SUCCESS;
+}
+
+// Function copies data out for the current node, then moves back.
+// FIXME: Could probably be done without locking. Reference counts should be enough to
+// protect access. Revisit.
+int keytree_iterate_prev(keytree_iterator_t *it, void *keybuf, void *valbuf) {
+  if (!it) return KEYTREE_INVAL;
+  else if (!it->curr) return KEYTREE_NO_SUCH_ELEMENT;
+
+  // Lock the tree for reading.
+  pthread_rwlock_rdlock(it->lock);
+
+  // Copy the data into the buffers for the current node.
+  memcpy(keybuf, it->curr->key, it->keysize);
+  memcpy(valbuf, it->curr->value, it->valsize);
+
+  // Update references.
+  __sync_fetch_and_sub(&it->curr->references, 1);
+  if (it->curr->prev) __sync_fetch_and_add(&it->curr->prev->references, 1);
+
+  // Update pointers, unlock, and return.
+  it->curr = it->curr->prev;
+  pthread_rwlock_unlock(it->lock);
+  return KEYTREE_SUCCESS;
+}
+
+// Function stops an interation.
+// Basically just decrements the reference for the current node and then frees
+// the iterator.
+// Not really any need to acquire the lock.
+void keytree_iterate_stop(keytree_iterator_t *it) {
+  if (!it) return;
+  if (it->curr) __sync_fetch_and_sub(&it->curr->references, 1);
+  free(it);
 }
 
 // Tree helper functions.
@@ -343,7 +454,7 @@ stack_t *internal_traverse(keytree_t *tree, void *key, int acquire) {
   tree_node_t *current = tree->root;
   while (current) {
     int comparison = tree->compare(key, current->key);
-    
+
     // We're pushing this node onto the stack, so increase the reference count.
     __sync_fetch_and_add(&current->references, 1);
     stack_push(stack, &current);

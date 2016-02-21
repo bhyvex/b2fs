@@ -175,7 +175,7 @@ list_iterator_t *literate_start(list_t *lst) {
 
 // FIXME: This function is naive. It's possible for the node it's iterating
 // across to be removed from the list and freed. Need to resolve this eventually.
-int literate_forward(list_iterator_t *it, void *voidbuf) {
+int literate_next(list_iterator_t *it, void *voidbuf) {
   if (!it) return LIST_INVAL;
 
   pthread_mutex_lock(it->lock);
@@ -194,7 +194,7 @@ int literate_forward(list_iterator_t *it, void *voidbuf) {
 
 // FIXME: This function is naive. It's possible for the node it's iterating
 // across to be removed from the list and freed. Need to resolve this eventually.
-int listerate_backward(list_iterator_t *it, void *voidbuf) {
+int literate_prev(list_iterator_t *it, void *voidbuf) {
   if (!it) return LIST_INVAL;
 
   pthread_mutex_lock(it->lock);

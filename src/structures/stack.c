@@ -41,7 +41,7 @@ stack_t *dup_stack(stack_t *stack, void (*destruct) (void *)) {
   char *voidbuf = malloc(lelem_len(stack->lst));
 
   list_iterator_t *it = literate_start(stack->lst);
-  while (literate_forward(it, voidbuf) == LIST_SUCCESS) stack_push(dup, voidbuf);
+  while (literate_next(it, voidbuf) == LIST_SUCCESS) stack_push(dup, voidbuf);
   literate_stop(it);
 
   free(voidbuf);
