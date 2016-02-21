@@ -5,26 +5,29 @@
 #include <pthread.h>
 #include "list.h"
 
+/*----- Numerical Constants -----*/
+
+#define LIST_WAIT_BASE 1000000
+
 /*----- Type Definitions -----*/
 
 typedef struct list_node {
   void *data;
+  int references;
   struct list_node *next, *prev;
 } list_node_t;
 
-// FIXME: Need to update these files. Use of a generic mutex is wasteful in this
-// instance. Should use a pthread_rwlock_t;
 struct list {
   list_node_t *head, *tail;
-  int count, dynamic, frozen, elem_len;
-  pthread_mutex_t mutex;
+  int count, frozen, elem_len;
+  pthread_rwlock_t lock;
   void (*destruct) (void *);
 };
 
 struct list_iterator {
-  list_node_t *next, *prev;
-  pthread_mutex_t *lock;
-  int elem_len;
+  list_node_t *next;
+  pthread_rwlock_t *lock;
+  int elem_len, reverse;
 };
 
 /*----- Internal Function Declarations -----*/
@@ -33,31 +36,22 @@ int intern_push(list_t *lst, void *data, int left);
 int intern_pop(list_t *lst, void *buf, int left);
 
 list_node_t *create_list_node(void *data, int elem_len);
-void destroy_list_node(list_node_t *node, void (*destruct) (void *));
+void destroy_list_node(list_node_t *node, pthread_rwlock_t *lock, void (*destruct) (void *));
 
 /*----- List Functions -----*/
-
-int setup_list(list_t *lst, int elem_len, void (*destruct) (void *)) {
-  int retval = pthread_mutex_init(&lst->mutex, NULL);
-  if (!retval) {
-    lst->head = NULL;
-    lst->tail = NULL;
-    lst->count = 0;
-    lst->frozen = 0;
-    lst->elem_len = elem_len;
-    lst->destruct = destruct;
-    return 1;
-  }
-  return 0;
-}
 
 // Function is responsible for creating a list struct.
 list_t *create_list(int elem_len, void (*destruct) (void *)) {
   list_t *lst = malloc(sizeof(list_t));
 
   if (lst) {
-    lst->dynamic = 1;
-    if (!setup_list(lst, elem_len, destruct)) {
+    lst->head = NULL;
+    lst->tail = NULL;
+    lst->count = 0;
+    lst->frozen = 0;
+    lst->elem_len = elem_len;
+    lst->destruct = destruct;
+    if (pthread_rwlock_init(&lst->lock, NULL)) {
       free(lst);
       lst = NULL;
     }
@@ -78,8 +72,9 @@ int rpush(list_t *lst, void *data) {
 
 int intern_push(list_t *lst, void *data, int left) {
   list_node_t *node = create_list_node(data, lst->elem_len);
+
   if (node) {
-    pthread_mutex_lock(&lst->mutex);
+    pthread_rwlock_wrlock(&lst->lock);
 
     if (lst->head && left) {
       // Push data into list at head.
@@ -98,7 +93,7 @@ int intern_push(list_t *lst, void *data, int left) {
     }
     lst->count++;
 
-    pthread_mutex_unlock(&lst->mutex);
+    pthread_rwlock_unlock(&lst->lock);
     return LIST_SUCCESS;
   }
 
@@ -108,18 +103,31 @@ int intern_push(list_t *lst, void *data, int left) {
 int rpop(list_t *lst, void *buf) {
   // Validate given parameters.
   if (!lst || !buf) return LIST_INVAL;
-  if (!lst->count) return LIST_EMPTY;
+
+  pthread_rwlock_rdlock(&lst->lock);
+  if (!lst->count) {
+    pthread_rwlock_unlock(&lst->lock);
+    return LIST_EMPTY;
+  }
   return intern_pop(lst, buf, 0);
 }
 
 int lpop(list_t *lst, void *buf) {
   if (!lst || !buf) return LIST_INVAL;
-  if (!lst->count) return  LIST_EMPTY;
+
+  pthread_rwlock_rdlock(&lst->lock);
+  if (!lst->count) {
+    pthread_rwlock_unlock(&lst->lock);
+    return LIST_EMPTY;
+  }
   return intern_pop(lst, buf, 1);
 }
 
+// Function takes care of actual popping work.
 int intern_pop(list_t *lst, void *buf, int left) {
-  pthread_mutex_lock(&lst->mutex);
+  // Function is called with read-lock held.
+  pthread_rwlock_unlock(&lst->lock);
+  pthread_rwlock_wrlock(&lst->lock);
 
   // Pop data off the end of the queue and decrement count.
   list_node_t *node = left ? lst->head : lst->tail;
@@ -137,81 +145,104 @@ int intern_pop(list_t *lst, void *buf, int left) {
   }
   lst->count--;
 
-  pthread_mutex_unlock(&lst->mutex);
-
   // Isolate the data, destroy the node, and return.
   memcpy(buf, node->data, lst->elem_len);
-  destroy_list_node(node, lst->destruct);
+  destroy_list_node(node, &lst->lock, lst->destruct);
+  pthread_rwlock_unlock(&lst->lock);
   return LIST_SUCCESS;
 }
 
+// FIXME: This function really shouldn't expose the data pointer directly, it should
+// take a buffer and copy out, but it makes things very convenient in my use case
+// to have it return a pointer directly. Obviously the returned pointer is unsafe
+// and must be used with care.
 void *lhead(list_t *lst) {
   if (!lst) return NULL;
-  else if (!lst->head) return NULL;
-  return lst->head->data;
+
+  pthread_rwlock_rdlock(&lst->lock);
+  if (!lst->head) {
+    pthread_rwlock_unlock(&lst->lock);
+    return NULL;
+  }
+  void *data = lst->head->data;
+  pthread_rwlock_unlock(&lst->lock);
+
+  return data;
 }
 
+// FIXME: This function really shouldn't expose the data pointer directly, it should
+// take a buffer and copy out, but it makes things very convenient in my use case
+// to have it return a pointer directly. Obviously the returned pointer is unsafe
+// and must be used with care.
 void *ltail(list_t *lst) {
   if (!lst) return NULL;
-  else if (!lst->tail) return NULL;
+
+  pthread_rwlock_rdlock(&lst->lock);
+  if (!lst->tail) {
+    pthread_rwlock_unlock(&lst->lock);
+    return NULL;
+  }
+  void *data = lst->head->data;
+  pthread_rwlock_unlock(&lst->lock);
+
   return lst->tail->data;
 }
 
-list_iterator_t *literate_start(list_t *lst) {
+list_iterator_t *literate_start(list_t *lst, int reverse) {
   if (!lst) return NULL;
 
   list_iterator_t *it = malloc(sizeof(list_iterator_t));
-  pthread_mutex_lock(&lst->mutex);
+  pthread_rwlock_rdlock(&lst->lock);
   if (it) {
-    it->next = lst->head;
-    it->prev = NULL;
+    // Assign pointers.
+    it->next = reverse ? lst->tail : lst->head;
+
+    // Increment references for entire list.
+    list_node_t *curr = it->next;
+    while (curr) {
+      __sync_fetch_and_add(&curr->references, 1);
+      curr = reverse ? curr->prev : curr->next;
+    }
     it->elem_len = lst->elem_len;
-    it->lock = &lst->mutex;
+    it->lock = &lst->lock;
+    it->reverse = reverse;
   }
-  pthread_mutex_unlock(&lst->mutex);
+  pthread_rwlock_unlock(&lst->lock);
 
   return it;
 }
 
-// FIXME: This function is naive. It's possible for the node it's iterating
-// across to be removed from the list and freed. Need to resolve this eventually.
+// FIXME: Seeing as the destruction functions honor reference counts, and insertions
+// and deletions can only occur at list ends, this could most likely be implemented
+// without acquiring a read-lock.
 int literate_next(list_iterator_t *it, void *voidbuf) {
   if (!it) return LIST_INVAL;
 
-  pthread_mutex_lock(it->lock);
   if (it->next) {
+    pthread_rwlock_rdlock(it->lock);
     list_node_t *next = it->next;
     memcpy(voidbuf, next->data, it->elem_len);
-    it->next = next->next;
-    it->prev = next->prev;
-    pthread_mutex_unlock(it->lock);
-    return LIST_SUCCESS;
-  } else {
-    pthread_mutex_unlock(it->lock);
-    return LIST_EMPTY;
-  }
-}
+    it->next = it->reverse ? next->prev : next->next;
 
-// FIXME: This function is naive. It's possible for the node it's iterating
-// across to be removed from the list and freed. Need to resolve this eventually.
-int literate_prev(list_iterator_t *it, void *voidbuf) {
-  if (!it) return LIST_INVAL;
-
-  pthread_mutex_lock(it->lock);
-  if (it->prev) {
-    list_node_t *prev = it->prev;
-    memcpy(voidbuf, prev->data, it->elem_len);
-    it->next = prev->next;
-    it->prev = prev->prev;
-    pthread_mutex_unlock(it->lock);
+    // Iterations only travel in one direction, so decrement the reference count for
+    // the node we're moving off of.
+    __sync_fetch_and_sub(&next->references, 1);
+    pthread_rwlock_unlock(it->lock);
     return LIST_SUCCESS;
-  } else {
-    pthread_mutex_unlock(it->lock);
-    return LIST_EMPTY;
   }
+
+  return LIST_EMPTY;
 }
 
 void literate_stop(list_iterator_t *it) {
+  if (!it) return;
+
+  // Decrement any remaining references.
+  list_node_t *curr = it->next;
+  while (curr) {
+    __sync_fetch_and_sub(&curr->references, 1);
+    curr = it->reverse ? curr->prev : curr->next;
+  }
   free(it);
 }
 
@@ -224,20 +255,22 @@ void destroy_list(list_t *lst) {
   if (!lst) return;
 
   // If list contains data, iterate across it, freeing nodes as we go.
+  pthread_rwlock_wrlock(&lst->lock);
   if (lst->count) {
     list_node_t *current = lst->head;
     while (current) {
       list_node_t *tmp = current;
       current = current->next;
-      destroy_list_node(tmp, lst->destruct);
+      destroy_list_node(tmp, &lst->lock, lst->destruct);
     }
   }
+  pthread_rwlock_unlock(&lst->lock);
 
   // Release the list's mutex.
-  pthread_mutex_destroy(&lst->mutex);
+  pthread_rwlock_destroy(&lst->lock);
 
   // Free list if necessary.
-  if (lst->dynamic) free(lst);
+  free(lst);
 }
 
 /*----- List Node Functions -----*/
@@ -250,6 +283,7 @@ list_node_t *create_list_node(void *data, int elem_len) {
   if (node && data_cpy) {
     node->data = data_cpy;
     memcpy(node->data, data, elem_len);
+    node->references = 0;
     node->next = NULL;
     node->prev = NULL;
   } else if (!data_cpy) {
@@ -263,7 +297,21 @@ list_node_t *create_list_node(void *data, int elem_len) {
 }
 
 // Function is responsible for destroying a list node.
-void destroy_list_node(list_node_t *node, void (*destruct) (void *)) {
+// Blocks until all references to the node have been forfeited, expects to be called
+// with the write-lock held, and does not release it.
+void destroy_list_node(list_node_t *node, pthread_rwlock_t *lock, void (*destruct) (void *)) {
+  struct timespec ts;
+  for (int i = 0; node->references; i++) {
+    pthread_rwlock_unlock(lock);
+    if (i > 10) i = 10;
+
+    int factor = 1 << i;
+    unsigned long long total_wait = LIST_WAIT_BASE * factor;
+    ts.tv_sec = total_wait / 1000000000;
+    ts.tv_nsec = total_wait % 1000000000;
+    nanosleep(&ts, NULL);
+    pthread_rwlock_wrlock(lock);
+  }
   destruct(node->data);
   free(node);
 }

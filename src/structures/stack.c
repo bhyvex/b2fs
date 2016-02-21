@@ -13,9 +13,7 @@ struct stack {
 stack_t *create_stack(void (*destruct) (void *), int elem_len) {
   stack_t *stack = malloc(sizeof(stack_t));
 
-   if (stack) {
-     stack->lst = create_list(elem_len, destruct);
-   }
+   if (stack) stack->lst = create_list(elem_len, destruct);
 
    return stack;
 }
@@ -40,7 +38,7 @@ stack_t *stack_dup(stack_t *stack, void (*destruct) (void *)) {
   stack_t *dup = create_stack(destruct, lelem_len(stack->lst));
   char *voidbuf = malloc(lelem_len(stack->lst));
 
-  list_iterator_t *it = literate_start(stack->lst);
+  list_iterator_t *it = literate_start(stack->lst, 0);
   while (literate_next(it, voidbuf) == LIST_SUCCESS) stack_push(dup, voidbuf);
   literate_stop(it);
 

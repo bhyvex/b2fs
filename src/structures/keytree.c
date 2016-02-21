@@ -81,6 +81,7 @@ void keytree_destroy(keytree_t *tree) {
   // returns.
   inorder_destruction(tree->root, &tree->lock, tree->key_destroy, tree->val_destroy);
   pthread_rwlock_unlock(&tree->lock);
+  pthread_rwlock_destroy(&tree->lock);
 
   // Finish up.
   free(tree);

@@ -29,7 +29,7 @@ void *lhead(list_t *lst);
 void *ltail(list_t *lst);
 
 // List Iterator Functions.
-list_iterator_t *literate_start(list_t *lst);
+list_iterator_t *literate_start(list_t *lst, int reverse);
 int literate_next(list_iterator_t *it, void *voidbuf);
 int literate_prev(list_iterator_t *it, void *voidbuf);
 void literate_stop(list_iterator_t *it);
