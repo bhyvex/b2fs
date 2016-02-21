@@ -61,17 +61,19 @@ int check_bit(bitmap_t *bits, int bit) {
 }
 
 int reserve(bitmap_t *bits) {
-  int found = 0;
+  int found = 0, broken = 0;
   for (int byte = 0; byte < bits->size; byte++) {
     for (int bit = 0; bit < 8; bit++) {
       char value = __sync_fetch_and_or(&bits->map[byte], (char) 1 << bit);
       if (!(value & 1 << bit)) {
         found = (8 * byte) + bit;
+        broken = 1;
         break;
       }
     }
+    if (broken) break;
   }
-  return found ? found : BITMAP_FULL_ERROR;
+  return broken ? found : BITMAP_FULL_ERROR;
 }
 
 void destroy_bitmap(bitmap_t *bits) {

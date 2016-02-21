@@ -15,14 +15,12 @@ typedef struct bitmap bitmap_t;
 
 /*----- Function Declaractions -----*/
 
-void init_bitmap(bitmap_t *bits, int size);
 bitmap_t *create_bitmap(int size);
+void destroy_bitmap(bitmap_t *bits);
 
 int set_bit(bitmap_t *bits, int bit);
 int clear_bit(bitmap_t *bits, int bit);
 int check_bit(bitmap_t *bits, int bit);
 int reserve(bitmap_t *bits);
-
-void destroy_bitmap(bitmap_t *bits);
 
 #endif
