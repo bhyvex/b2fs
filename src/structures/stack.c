@@ -36,7 +36,7 @@ void *stack_peek(stack_t *stack) {
   return lhead(stack->lst);
 }
 
-stack_t *dup_stack(stack_t *stack, void (*destruct) (void *)) {
+stack_t *stack_dup(stack_t *stack, void (*destruct) (void *)) {
   stack_t *dup = create_stack(destruct, lelem_len(stack->lst));
   char *voidbuf = malloc(lelem_len(stack->lst));
 

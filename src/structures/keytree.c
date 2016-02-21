@@ -42,6 +42,7 @@ stack_t *internal_traverse(keytree_t *tree, void *key, int acquire);
 tree_node_t *balance(tree_node_t *subtree);
 tree_node_t *rotate_right(tree_node_t *subtree);
 tree_node_t *rotate_left(tree_node_t *subtree);
+void hook_up(keytree_t *tree, void *key);
 void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *));
 int subtree_height(tree_node_t *subtree);
 tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize);
@@ -143,6 +144,13 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
     if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
     else parent->left = balance(current);
   }
+
+  // Now that the value has been inserted into the tree, hook it into the list.
+  // Unfortunately this can't easily be done during insertion as the structure
+  // of the tree is still subject to change.
+  // Basically I'm lazy and don't care to figure it out.
+  hook_up(tree, key);
+
   pthread_rwlock_unlock(&tree->lock);
   destroy_stack(stack);
 
@@ -313,6 +321,11 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
         else parent->left = balance(current);
       }
+
+      // Update links in the list.
+      tree_node_t *prev = removed->prev, *next = removed->next;
+      prev->next = next;
+      next->prev = prev;
 
       // Oh Jesus. We're done. Talk about an exhausting function. Clean up and return.
       destroy_stack(stack);
@@ -509,6 +522,74 @@ tree_node_t *rotate_left(tree_node_t *subtree) {
   subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
   left_child->height = MAX(subtree_height(left_child->left), subtree->height);
   return left_child;
+}
+
+// Function hooks a just inserted node with the given key into the list.
+void hook_up(keytree_t *tree, void *key) {
+  stack_t *stack = internal_traverse(tree, key, 0);
+  tree_node_t *prev = NULL, *curr, *next = NULL;
+  stack_pop(stack, &curr);
+
+  // First try finding the inorder predecessor.
+  if (curr->left) {
+    // If a left child exists, inorder predecessor exists all the way to the right
+    // of it.
+    prev = curr->left;
+    while (prev->right) prev = prev->right;
+  } else {
+    // We may need to use it again, so duplicate the stack.
+    stack_t *copy = stack_dup(stack, free);
+
+    // If no left child exists, inorder predecessor, if it exists, is the first
+    // parent in the stack that is smaller than its child.
+    tree_node_t *child = curr, *parent;
+    while (stack_pop(copy, &parent) == STACK_SUCCESS) {
+      if (tree->compare(parent, child) < 0) {
+        // We've found it!
+        prev = parent;
+        break;
+      }
+      child = parent;
+    }
+    destroy_stack(copy);
+  }
+
+  // If we couldn't find a predecessor, we've inserted the new smallest element into
+  // the tree. Instead find the successor.
+  if (curr->right && !prev) {
+    // If a right child exists, inorder successor exists all the way to the left
+    // of it.
+    next = curr->right;
+    while (next->left) next = next->left;
+  } else if (!prev) {
+    // If no left child exists, inorder successor is the first parent in the stack
+    // that is larger than its child.
+    tree_node_t *child = curr, *parent;
+    while (stack_pop(stack, &parent) == STACK_SUCCESS) {
+      if (tree->compare(parent, child) > 0) {
+        // We've found it!
+        next = parent;
+        break;
+      }
+      child = parent;
+    }
+  }
+  destroy_stack(stack);
+
+  // Hook up the links.
+  if (prev) {
+    next = prev->next;
+    prev->next = curr;
+    curr->prev = prev;
+    curr->next = next;
+    next->prev = curr;
+  } else if (next) {
+    prev = next->prev;
+    next->prev = curr;
+    curr->next = next;
+    prev->next = curr;
+    curr->prev = prev;
+  }
 }
 
 void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
