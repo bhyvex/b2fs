@@ -7,6 +7,7 @@
 /*----- Local Includes -----*/
 
 #include "hash.h"
+#include "../xxhash/xxhash.h"
 
 /*----- Type Definitions -----*/
 
@@ -73,17 +74,6 @@ int init_hash(hash_t *table, void (*destruct) (void *)) {
   return HASH_INVAL;
 }
 
-// Function handles creation of a hash value for a given string.
-// FIXME: Really need to replace this with some sort of competent
-// hashing function like xxhash.
-int hash_key(char *key, int size) {
-  int proto_hash = 0;
-  for (unsigned int i = 0; i < strlen(key); i++) {
-    proto_hash += (int) key[i];
-  }
-  return proto_hash % size;
-}
-
 // Function handles the rehash process encountered when a hash reaches
 // 80% capacity. Hate locking the entire function, but we're rehashing, so it's
 // pretty much unavoidable.
@@ -109,7 +99,7 @@ void rehash(hash_t *table) {
       current->next = NULL;
 
       // Calculate new hash value and insert.
-      int hash = hash_key(current->key, table->size * 2);
+      int hash = (int) XXH64(current->key, strlen(current->key), 0) % (table->size * 2);
       if (new_data[hash]) {
         insert_hash_node(new_data[hash], current);
       } else {
@@ -137,7 +127,7 @@ int hash_put(hash_t *table, char *key, void *data) {
   if (table->count / (float) table->size > 0.8) rehash(table);
 
   // Generate hash value and insert.
-  int hash = hash_key(key, table->size);
+  int hash = (int) XXH64(key, strlen(key), 0) % table->size;
 
   // Acquire write lock.
   pthread_rwlock_rdlock(&table->lock);
@@ -194,7 +184,7 @@ void *hash_get(hash_t *table, char *key) {
   if (!table || !table->count || !key) return NULL;
 
   // Generate hash value.
-  int hash = hash_key(key, table->size);
+  int hash = (int) XXH64(key, strlen(key), 0) % table->size;
 
   // Acquire read-lock and find it.
   pthread_rwlock_rdlock(&table->lock);
@@ -218,7 +208,7 @@ int hash_drop(hash_t *table, char *key) {
   if (!table || table->count == 0 || !key) return HASH_INVAL;
 
   // Generate hash value and find data.
-  int hash = hash_key(key, table->size);
+  int hash = (int) XXH64(key, strlen(key), 0) % table->size;
 
   // Acquire read lock for searching.
   pthread_rwlock_rdlock(&table->lock);

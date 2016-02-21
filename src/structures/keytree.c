@@ -504,7 +504,10 @@ tree_node_t *balance(tree_node_t *subtree) {
       subtree = rotate_right(subtree);
     }
   }
+
+  // Update the height.
   subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
+  return subtree;
 }
 
 tree_node_t *rotate_right(tree_node_t *subtree) {

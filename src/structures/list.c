@@ -185,7 +185,7 @@ void *ltail(list_t *lst) {
   void *data = lst->head->data;
   pthread_rwlock_unlock(&lst->lock);
 
-  return lst->tail->data;
+  return data;
 }
 
 list_iterator_t *literate_start(list_t *lst, int reverse) {
