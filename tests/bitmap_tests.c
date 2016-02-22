@@ -32,6 +32,7 @@ int main(int argc, char **argv) {
     {0, 0, 0, 0}
   };
 
+  // Get CLI options.
   while ((c = getopt_long(argc, argv, "n:s:", long_options, &index)) != -1) {
     switch (c) {
       case 'n':
@@ -74,6 +75,13 @@ int main(int argc, char **argv) {
   // Double check that clear_bit is working.
   for (int i = 0; i < map_size; i++) assert(clear_bit(double_check, i) == BITMAP_SUCCESS);
 
+  // Bitmap works. Cleanup and exit.
+  free(threads);
+  free(args);
+  for (int i = 0; i < num_threads; i++) free(thread_bits[i]);
+  free(thread_bits);
+  destroy_bitmap(map);
+  destroy_bitmap(double_check);
   return EXIT_SUCCESS;
 }
 
