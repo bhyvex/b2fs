@@ -60,6 +60,8 @@ int main(int argc, char **argv) {
   char ***thread_keys = malloc(sizeof(char **) * num_threads);
   voidargs_t *args = malloc(sizeof(voidargs_t) * num_threads);
   pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
+
+  // Start the threads working.
   for (int i = 0; i < num_threads; i++) {
     thread_keys[i] = calloc(sizeof(char **), num_insertions);
     args[i] = (voidargs_t) {hash, thread_keys[i], num_insertions, strlen, rand()};

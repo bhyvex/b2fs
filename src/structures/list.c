@@ -126,8 +126,14 @@ int lpop(list_t *lst, void *buf) {
 // Function takes care of actual popping work.
 int intern_pop(list_t *lst, void *buf, int left) {
   // Function is called with read-lock held.
+  // Since you can't upgrade a read-lock to a write lock atomically, we need to
+  // recheck that there is still an item to dequeue after acquiring the write-lock.
   pthread_rwlock_unlock(&lst->lock);
   pthread_rwlock_wrlock(&lst->lock);
+  if (!lst->count) {
+    pthread_rwlock_unlock(&lst->lock);
+    return LIST_EMPTY;
+  }
 
   // Pop data off the end of the queue and decrement count.
   list_node_t *node = left ? lst->head : lst->tail;
