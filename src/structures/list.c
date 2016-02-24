@@ -158,40 +158,34 @@ int intern_pop(list_t *lst, void *buf, int left) {
   return LIST_SUCCESS;
 }
 
-// FIXME: This function really shouldn't expose the data pointer directly, it should
-// take a buffer and copy out, but it makes things very convenient in my use case
-// to have it return a pointer directly. Obviously the returned pointer is unsafe
-// and must be used with care.
-void *lhead(list_t *lst) {
-  if (!lst) return NULL;
+int lhead(list_t *lst, void *buf) {
+  if (!lst) return LIST_INVAL;
 
   pthread_rwlock_rdlock(&lst->lock);
   if (!lst->head) {
     pthread_rwlock_unlock(&lst->lock);
-    return NULL;
+    return LIST_EMPTY;
   }
   void *data = lst->head->data;
+  memcpy(buf, data, lst->elem_len);
   pthread_rwlock_unlock(&lst->lock);
 
-  return data;
+  return LIST_SUCCESS;
 }
 
-// FIXME: This function really shouldn't expose the data pointer directly, it should
-// take a buffer and copy out, but it makes things very convenient in my use case
-// to have it return a pointer directly. Obviously the returned pointer is unsafe
-// and must be used with care.
-void *ltail(list_t *lst) {
-  if (!lst) return NULL;
+int ltail(list_t *lst, void *buf) {
+  if (!lst) return LIST_INVAL;
 
   pthread_rwlock_rdlock(&lst->lock);
   if (!lst->tail) {
     pthread_rwlock_unlock(&lst->lock);
-    return NULL;
+    return LIST_EMPTY;
   }
   void *data = lst->head->data;
+  memcpy(buf, data, lst->elem_len);
   pthread_rwlock_unlock(&lst->lock);
 
-  return data;
+  return LIST_SUCCESS;
 }
 
 list_iterator_t *literate_start(list_t *lst, int reverse) {

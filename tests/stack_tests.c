@@ -17,8 +17,6 @@ typedef struct voidargs {
   stack_t *stack;
 } voidargs_t;
 
-/*----- Globals -----*/
-
 /*----- Function Declarations -----*/
 
 void *test_stack(void *voidargs);
@@ -69,6 +67,7 @@ int main(int argc, char **argv) {
   free(threads);
   free(args);
   destroy_stack(stack);
+  return EXIT_SUCCESS;
 }
 
 void *test_stack(void *voidargs) {

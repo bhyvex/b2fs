@@ -16,7 +16,7 @@ typedef struct stack stack_t;
 stack_t *create_stack(void (*destruct) (void *), int elem_len);
 void stack_push(stack_t *stack, void *data);
 int stack_pop(stack_t *stack, void *buf);
-void *stack_peek(stack_t *stack);
+int stack_peek(stack_t *stack, void *buf);
 stack_t *stack_dup(stack_t *stack, void (*destruct) (void *));
 void destroy_stack(stack_t *stack);
 

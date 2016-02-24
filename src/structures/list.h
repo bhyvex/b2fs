@@ -25,8 +25,8 @@ int lpush(list_t *lst, void *data);
 int rpush(list_t *lst, void *data);
 int lpop(list_t *lst, void *buf);
 int rpop(list_t *lst, void *buf);
-void *lhead(list_t *lst);
-void *ltail(list_t *lst);
+int lhead(list_t *lst, void *buf);
+int ltail(list_t *lst, void *buf);
 
 // List Iterator Functions.
 list_iterator_t *literate_start(list_t *lst, int reverse);

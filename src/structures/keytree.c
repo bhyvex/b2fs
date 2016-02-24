@@ -106,7 +106,7 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
   // This whole dance is necessary so that we can avoid acquiring the write-lock
   // for as long as possible.
   stack_t *stack;
-  tree_node_t *current;
+  tree_node_t *current, *parent, *child;
   while (1) {
     // Traverse to find insertion point.
     // Note that the read-lock is no longer held when this returns.
@@ -114,7 +114,8 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
 
     // Attempt to lock insertion point.
     pthread_rwlock_wrlock(&tree->lock);
-    tree_node_t *parent = stack_peek(stack), *child = NULL;
+    child = NULL;
+    stack_peek(stack, &parent);
     if (tree->compare(key, parent->key) > 0) {
       child = parent->right;
     } else if (tree->compare(key, parent->key) < 0) {
@@ -141,7 +142,7 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
     }
 
     // Balance.
-    tree_node_t *parent = stack_peek(stack);
+    stack_peek(stack, &parent);
     if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
     else parent->left = balance(current);
   }
@@ -171,9 +172,10 @@ int keytree_find(keytree_t *tree, void *key, void *valbuf) {
   // and keytree_remove, and while they could reorganize the tree on us, we've
   // already found our node, and we still hold a reference to it, so it can't be freed
   // yet, and keytree_insert doesn't mutate in place.
-  if (!tree->compare(((tree_node_t *) stack_peek(stack))->key, key)) {
+  tree_node_t *target;
+  int retval = stack_peek(stack, &target);
+  if (retval == STACK_SUCCESS && !tree->compare(target->key, key)) {
     // This is the node we're looking for.
-    tree_node_t *target = stack_peek(stack);
     memcpy(valbuf, target->value, tree->valsize);
     success = 1;
   }
@@ -192,6 +194,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
   if (!tree->root) return KEYTREE_NO_SUCH_ELEMENT;
 
   // Traverse tree to find the element we want to remove.
+  tree_node_t *tmp;
   stack_t *stack = internal_traverse(tree, key, 1);
 
   // FIXME: I do not believe that we need to hold the read lock for this line for
@@ -201,7 +204,10 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
   // have been reorganized, but we only care about the structure of the tree while
   // holding the write lock. If it's mutated by us, we'll perform a double check
   // to make sure the node still exists.
-  if (!tree->compare(((tree_node_t *) stack_peek(stack))->key, key)) {
+  // We do need to check the return value of stack_peek, though, as someone could have
+  // deleted the whole tree while we were acquiring the original read-lock.
+  int retval = stack_peek(stack, &tmp);
+  if (retval == STACK_SUCCESS && !tree->compare(tmp->key, key)) {
     tree_node_t *removed;
 
     // Forfeit our references to the deleted nodes, acquire write lock, and attempt
@@ -225,7 +231,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
 
     // Note that we do not acquire a read lock for this traversal.
     stack = internal_traverse(tree, key, 0);
-    if (!tree->compare(((tree_node_t *) stack_peek(stack))->key, key)) {
+    retval = stack_peek(stack, &tmp);
+    if (retval == STACK_SUCCESS && !tree->compare(tmp->key, key)) {
       // We are the leader (or there is no contention)!
       // Remove and rebalance.
       tree_node_t *parent, *current, *successor;
@@ -234,7 +241,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       // from the stack (will be used later for rebalancing), but not the parent
       // yet.
       stack_pop(stack, &removed);
-      parent = stack_peek(stack);
+      stack_peek(stack, &parent);
 
       // Figure out how much work we need to do.
       int comparison = parent ? tree->compare(parent->key, key) : 0;
@@ -281,11 +288,12 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         stack_pop(successor_stack, &successor);
 
         // Remove successor from old position in the tree and assign new children.
-        if (stack_peek(successor_stack)) {
+        stack_peek(successor_stack, &tmp);
+        if (tmp) {
           // If successor is removed->right, there's nothing to do as its parent
           // will be removed anyways. If not, do this.
           // We know by definition that successor->left is NULL.
-          ((tree_node_t *) stack_peek(successor_stack))->left = successor->right;
+          tmp->left = successor->right;
           successor->right = removed->right;
         }
         successor->left = removed->left;
@@ -302,7 +310,11 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
 
         // Rebalance nodes visited on the way to the successor.
         while (stack_pop(successor_stack, &current) == STACK_SUCCESS) {
-          parent = stack_peek(successor_stack);
+          stack_peek(successor_stack, &parent);
+
+          // FIXME: I'm not 100% sure this is correct. Revisit this. Either way, I can't
+          // think of a reason why it would be gauranteed that the parent would exist.
+          if (!parent) parent = successor;
           if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
           else parent->left = balance(current);
         }
@@ -318,8 +330,9 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
 
       // Time to rebalance!
       while (stack_pop(stack, &current) == STACK_SUCCESS) {
-        tree_node_t *parent = stack_peek(stack);
-        if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
+        retval = stack_peek(stack, &parent);
+        if (retval != STACK_SUCCESS) tree->root = balance(current);
+        else if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
         else parent->left = balance(current);
       }
 

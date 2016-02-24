@@ -29,9 +29,10 @@ int stack_pop(stack_t *stack, void *buf) {
   else return STACK_SUCCESS;
 }
 
-void *stack_peek(stack_t *stack) {
-  if (!stack) return NULL;
-  return lhead(stack->lst);
+int stack_peek(stack_t *stack, void *buf) {
+  if (!stack) return STACK_INVAL;
+  if (lhead(stack->lst, buf) == LIST_EMPTY) return STACK_EMPTY;
+  else return STACK_SUCCESS;
 }
 
 stack_t *stack_dup(stack_t *stack, void (*destruct) (void *)) {
