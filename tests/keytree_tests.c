@@ -26,12 +26,13 @@ char alpha[] = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h','i', 'j', 'k', 'l', 'm', 
 /*----- Function Declarations -----*/
 
 void *build_tree(void *voidargs);
+int keycomp(void *key_one, void *key_two);
 void destroy_and_decrement(void *voidarg);
 
 /*----- Function Implementations -----*/
 
 int main(int argc, char **argv) {
-  int c, index, num_operations = 1024, num_threads = 4, strlens = 10;
+  int c, index, num_operations = 1024, num_threads = 4, strlens = 10, double_check = 0;
   struct option long_options[] = {
     {"num-operations", required_argument, 0, 'n'},
     {"string-length", required_argument, 0, 's'},
@@ -54,7 +55,7 @@ int main(int argc, char **argv) {
   }
 
   // Make necessary allocations.
-  keytree_t *tree = create_keytree(free, destroy_and_decrement, (int (*) (void *, void *)) strcmp, sizeof(char *), sizeof(char *));
+  keytree_t *tree = create_keytree(free, destroy_and_decrement, keycomp, sizeof(char *), sizeof(char *));
   voidargs_t *args = malloc(sizeof(voidargs_t) * num_threads);
   pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
 
@@ -68,11 +69,18 @@ int main(int argc, char **argv) {
 
   // Validate the tree's structure.
   keytree_iterator_t *it = keytree_iterate_start(tree, NULL);
-  char *keybuf, *valbuf, *oldbuf = NULL;
-  while (keytree_iterate_next(it, &keybuf, &valbuf) == KEYTREE_SUCCESS) {
+  char *keybuf, *valbuf, *oldbuf = NULL, *first = NULL;
+  while (double_check++ < num_threads * num_operations) {
+    int retval = keytree_iterate_next(it, &keybuf, &valbuf);
+    assert(retval == KEYTREE_SUCCESS);
     assert(!strcmp(keybuf, valbuf));
+    if (!first) first = keybuf;
     if (oldbuf) assert(strcmp(oldbuf, keybuf) < 0);
+    oldbuf = keybuf;
   }
+  keytree_iterate_next(it, &keybuf, &valbuf);
+  assert(!strcmp(keybuf, first));
+  keytree_iterate_stop(it);
 
   // Destroy tree and verify all destructors fired.
   keytree_destroy(tree);
@@ -102,7 +110,7 @@ void *build_tree(void *voidargs) {
       for (int j = 0; j < strlens; j++) output[i][j] = alpha[rand_r(&seed) % 26];
       output[i][strlens] = '\0';
 
-      if (keytree_insert(tree, output[i], output[i]) == KEYTREE_SUCCESS) break;
+      if (keytree_insert(tree, &output[i], &output[i]) == KEYTREE_SUCCESS) break;
     }
 
     // Increment the insertion counter.
@@ -110,6 +118,10 @@ void *build_tree(void *voidargs) {
   }
 
   return NULL;
+}
+
+int keycomp(void *key_one, void *key_two) {
+  return strcmp(*(char **) key_one, *(char **) key_two);
 }
 
 void destroy_and_decrement(void *voidarg) {
