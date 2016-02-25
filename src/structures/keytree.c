@@ -1,11 +1,13 @@
 /*----- Includes -----*/
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
 #include "keytree.h"
 #include "stack.h"
+#include "list.h"
 
 /*----- Macro Definitions -----*/
 
@@ -142,8 +144,9 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
     }
 
     // Balance.
-    stack_peek(stack, &parent);
-    if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
+    int retval = stack_peek(stack, &parent);
+    if (retval != STACK_SUCCESS) tree->root = balance(current);
+    else if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
     else parent->left = balance(current);
   }
 
@@ -282,7 +285,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         stack_t *successor_stack = create_stack(free, sizeof(tree_node_t *));
         current = removed->right;
         while (current) {
-          stack_push(successor_stack, current);
+          stack_push(successor_stack, &current);
           current = current->left;
         }
         stack_pop(successor_stack, &successor);
@@ -325,7 +328,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         // We also need to increment the reference count of the successor as it will
         // be decremented during balancing.
         __sync_fetch_and_add(&successor->references, 1);
-        stack_push(stack, successor);
+        stack_push(stack, &successor);
       }
 
       // Time to rebalance!
@@ -537,7 +540,7 @@ tree_node_t *rotate_left(tree_node_t *subtree) {
   subtree->left = left_child->right;
   left_child->right = subtree;
   subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
-  left_child->height = MAX(subtree_height(left_child->left), subtree->height);
+  left_child->height = MAX(subtree_height(left_child->left), subtree->height) + 1;
   return left_child;
 }
 
@@ -561,7 +564,7 @@ void hook_up(keytree_t *tree, void *key) {
     // parent in the stack that is smaller than its child.
     tree_node_t *child = curr, *parent;
     while (stack_pop(copy, &parent) == STACK_SUCCESS) {
-      if (tree->compare(parent, child) < 0) {
+      if (tree->compare(parent->key, child->key) < 0) {
         // We've found it!
         prev = parent;
         break;
@@ -583,7 +586,7 @@ void hook_up(keytree_t *tree, void *key) {
     // that is larger than its child.
     tree_node_t *child = curr, *parent;
     while (stack_pop(stack, &parent) == STACK_SUCCESS) {
-      if (tree->compare(parent, child) > 0) {
+      if (tree->compare(parent->key, child->key) > 0) {
         // We've found it!
         next = parent;
         break;
@@ -669,4 +672,16 @@ void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_des
 
   // We're done. Unlock and return.
   if (release) pthread_rwlock_unlock(lock);
+}
+
+void print_tree(keytree_t *tree) {
+  list_t *lst = create_list(sizeof(tree_node_t *), free);
+  lpush(lst, &tree->root);
+
+  tree_node_t *current;
+  while (rpop(lst, &current) != LIST_EMPTY) {
+    printf(" (%s) ", current->key);
+    if (current->left) lpush(lst, &current->left);
+    if (current->right) lpush(lst, &current->right);
+  }
 }
