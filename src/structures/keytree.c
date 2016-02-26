@@ -48,8 +48,9 @@ void hook_up(keytree_t *tree, void *key);
 void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *));
 int subtree_height(tree_node_t *subtree);
 tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize);
+void wait_on_references(tree_node_t *node, pthread_rwlock_t *lock);
 void dereference_and_destroy(void *voidarg);
-void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *), int release);
+void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*val_destroy) (void *));
 
 /*----- Function Implementations -----*/
 
@@ -171,9 +172,9 @@ int keytree_find(keytree_t *tree, void *key, void *valbuf) {
   int success = 0;
   stack_t *stack = internal_traverse(tree, key, 1);
 
-  // FIXME: I do not believe that we need to hold the read lock for the following
-  // comparison line. The only functions that can mutate the tree are keytree_insert,
-  // and keytree_remove, and while they could reorganize the tree on us, we've
+  // Read lock does not need to be held for the following comparison line.
+  // The only functions that can mutate the tree are keytree_insert, and
+  // keytree_remove, and while they could reorganize the tree on us, we've
   // already found our node, and we still hold a reference to it, so it can't be freed
   // yet, and keytree_insert doesn't mutate in place.
   tree_node_t *target;
@@ -250,7 +251,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       // Figure out how much work we need to do.
       int comparison = parent_status == STACK_SUCCESS ? tree->compare(key, parent->key) : 0;
       if (!removed->left && !removed->right) {
-        // Easy life. Node has no children.
+        // Easy life. Node has no children. Wait for references to hit zero and remove.
+        wait_on_references(removed, &tree->lock);
         if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = NULL;
@@ -262,6 +264,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         }
       } else if (removed->right && !removed->left) {
         // 1 child. Need to reassign a child, but that's it.
+        // Wait for references to hit zero and remove.
+        wait_on_references(removed, &tree->lock);
         if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = removed->right;
@@ -272,6 +276,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         }
       } else if (removed->left && !removed->right) {
         // 1 child. Need to reassign a child, but that's it.
+        // Wait for references to hit zero and remove.
+        wait_on_references(removed, &tree->lock);
         if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = removed->left;
@@ -290,6 +296,10 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
           current = current->left;
         }
         stack_pop(successor_stack, &successor);
+
+        // Alright, we have to start mutating things. Wait for references to hit
+        // zero on the removed node.
+        wait_on_references(removed, &tree->lock);
 
         // Remove successor from old position in the tree and assign new children.
         retval = stack_peek(successor_stack, &tmp);
@@ -316,8 +326,6 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         while (stack_pop(successor_stack, &current) == STACK_SUCCESS) {
           retval = stack_peek(successor_stack, &parent);
 
-          // FIXME: I'm not 100% sure this is correct. Revisit this. Either way, I can't
-          // think of a reason why it would be gauranteed that the parent would exist.
           if (retval != STACK_SUCCESS) parent = successor;
           if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
           else parent->left = balance(current);
@@ -353,7 +361,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
 
       // Note that this will block until all other references to the node have been
       // released, and that it will also release the write-lock.
-      destroy_tree_node(removed, &tree->lock, tree->key_destroy, tree->val_destroy, 1);
+      destroy_tree_node(removed, tree->key_destroy, tree->val_destroy);
       return KEYTREE_SUCCESS;
     } else {
       // We are a follower...
@@ -618,7 +626,7 @@ void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*ke
 
   tree_node_t *left_subtree = subtree->left, *right_subtree = subtree->right;
   inorder_destruction(left_subtree, lock, key_destroy, val_destroy);
-  destroy_tree_node(subtree, lock, key_destroy, val_destroy, 0);
+  destroy_tree_node(subtree, key_destroy, val_destroy);
   inorder_destruction(right_subtree, lock, key_destroy, val_destroy);
 }
 
@@ -642,16 +650,9 @@ tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize) 
   return node;
 }
 
-void dereference_and_destroy(void *voidarg) {
-  tree_node_t **node_ptr = voidarg;
-  __sync_fetch_and_sub(&((*node_ptr)->references), 1);
-  free(node_ptr);
-}
-
-// Function takes care of destroying a tree node.
-// Function blocks until node references hit 0.
-// Function expects wrlock to be held when called.
-void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *), int release) {
+// Function blocks until the given node's references have hit zero.
+// Expects to be called with the write-lock held. Returns with it still held.
+void wait_on_references(tree_node_t *node, pthread_rwlock_t *lock) {
   struct timespec ts;
   for (int i = 0; node->references; i++) {
     pthread_rwlock_unlock(lock);
@@ -665,14 +666,19 @@ void destroy_tree_node(tree_node_t *node, pthread_rwlock_t *lock, void (*key_des
     nanosleep(&ts, NULL);
     pthread_rwlock_wrlock(lock);
   }
+}
 
-  // References are now 0. Destroy the node while we can.
+void dereference_and_destroy(void *voidarg) {
+  tree_node_t **node_ptr = voidarg;
+  __sync_fetch_and_sub(&((*node_ptr)->references), 1);
+  free(node_ptr);
+}
+
+// Function takes care of destroying a tree node.
+void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
   key_destroy(node->key);
   val_destroy(node->value);
   free(node);
-
-  // We're done. Unlock and return.
-  if (release) pthread_rwlock_unlock(lock);
 }
 
 void print_tree(keytree_t *tree) {
