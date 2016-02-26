@@ -353,15 +353,17 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       prev->next = next;
       next->prev = prev;
 
-      // Oh Jesus. We're done. Talk about an exhausting function. Clean up and return.
+      // All references to the node have been removed from the tree. Release
+      // references and lock.
+      pthread_rwlock_unlock(&tree->lock);
       destroy_stack(stack);
 
-      // Copy the data out if the user gave us somewhere to do it.
+      // Copy the data out if the user gave us somewhere to put it.
       if (valbuf) memcpy(valbuf, removed->value, tree->valsize);
 
-      // Note that this will block until all other references to the node have been
-      // released, and that it will also release the write-lock.
+      // Free the node.
       destroy_tree_node(removed, tree->key_destroy, tree->val_destroy);
+
       return KEYTREE_SUCCESS;
     } else {
       // We are a follower...
