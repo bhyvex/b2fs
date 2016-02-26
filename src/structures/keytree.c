@@ -124,6 +124,7 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
       child = parent->left;
     } else {
       // Duplicate.
+      destroy_stack(stack);
       pthread_rwlock_unlock(&tree->lock);
       return KEYTREE_DUPLICATE;
     }
@@ -244,13 +245,13 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       // from the stack (will be used later for rebalancing), but not the parent
       // yet.
       stack_pop(stack, &removed);
-      stack_peek(stack, &parent);
+      int parent_status = stack_peek(stack, &parent);
 
       // Figure out how much work we need to do.
-      int comparison = parent ? tree->compare(parent->key, key) : 0;
+      int comparison = parent_status == STACK_SUCCESS ? tree->compare(key, parent->key) : 0;
       if (!removed->left && !removed->right) {
         // Easy life. Node has no children.
-        if (parent) {
+        if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = NULL;
           else parent->left = NULL;
@@ -261,7 +262,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         }
       } else if (removed->right && !removed->left) {
         // 1 child. Need to reassign a child, but that's it.
-        if (parent) {
+        if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = removed->right;
           else parent->left = removed->right;
@@ -271,7 +272,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         }
       } else if (removed->left && !removed->right) {
         // 1 child. Need to reassign a child, but that's it.
-        if (parent) {
+        if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = removed->left;
           else parent->left = removed->left;
@@ -291,8 +292,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         stack_pop(successor_stack, &successor);
 
         // Remove successor from old position in the tree and assign new children.
-        stack_peek(successor_stack, &tmp);
-        if (tmp) {
+        retval = stack_peek(successor_stack, &tmp);
+        if (retval == STACK_SUCCESS) {
           // If successor is removed->right, there's nothing to do as its parent
           // will be removed anyways. If not, do this.
           // We know by definition that successor->left is NULL.
@@ -302,7 +303,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         successor->left = removed->left;
 
         // Replace deleted node with successor.
-        if (parent) {
+        if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = successor;
           else parent->left = successor;
@@ -313,11 +314,11 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
 
         // Rebalance nodes visited on the way to the successor.
         while (stack_pop(successor_stack, &current) == STACK_SUCCESS) {
-          stack_peek(successor_stack, &parent);
+          retval = stack_peek(successor_stack, &parent);
 
           // FIXME: I'm not 100% sure this is correct. Revisit this. Either way, I can't
           // think of a reason why it would be gauranteed that the parent would exist.
-          if (!parent) parent = successor;
+          if (retval != STACK_SUCCESS) parent = successor;
           if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
           else parent->left = balance(current);
         }

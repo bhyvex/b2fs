@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
   // Validate the tree's structure.
   keytree_iterator_t *it = keytree_iterate_start(tree, NULL);
   char *keybuf, *valbuf, *oldbuf = NULL, *first = NULL;
-  while (double_check++ < num_threads * num_operations) {
+  while (double_check++ < (num_threads * num_operations) / 2) {
     int retval = keytree_iterate_next(it, &keybuf, &valbuf);
     assert(retval == KEYTREE_SUCCESS);
     assert(!strcmp(keybuf, valbuf));
@@ -89,7 +89,6 @@ int main(int argc, char **argv) {
   // Tree structure is valid. Clean up and return.
   free(args);
   free(threads);
-  keytree_destroy(tree);
   return EXIT_SUCCESS;
 }
 
@@ -101,6 +100,7 @@ void *build_tree(void *voidargs) {
   keytree_t *tree = args->tree;
   char **output = args->output;
 
+  // Insert a bunch of random strings into the tree.
   for (int i = 0; i < num_operations; i++) {
     // Make room for the string.
     output[i] = malloc(sizeof(char) * (strlens + 1));
@@ -110,11 +110,28 @@ void *build_tree(void *voidargs) {
       for (int j = 0; j < strlens; j++) output[i][j] = alpha[rand_r(&seed) % 26];
       output[i][strlens] = '\0';
 
+      // Insert.
       if (keytree_insert(tree, &output[i], &output[i]) == KEYTREE_SUCCESS) break;
     }
 
     // Increment the insertion counter.
     __sync_fetch_and_add(&insertion_count, 1);
+  }
+
+  // Find and delete every other key we inserted into the tree.
+  for (int i = 0; i < num_operations; i++) {
+    char *value;
+
+    if (i % 2 == 0) {
+      // Find the node.
+      keytree_find(tree, &output[i], &value);
+    } else {
+      // Remove the node.
+      keytree_remove(tree, &output[i], &value);
+    }
+
+    // Verify that the tree returned the proper value.
+    assert(!strcmp(output[i], value));
   }
 
   return NULL;
