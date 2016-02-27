@@ -7,22 +7,21 @@
 /*----- Type Definitions -----*/
 
 struct bitmap {
-  int size, occupied, alloc;
+  int size;
   char *map;
 };
 
 /*----- Function Implementations -----*/
 
-void init_bitmap(bitmap_t *bits, int size) {
-  memset(bits, 0, sizeof(bitmap_t));
-  bits->map = calloc(sizeof(char) * size, 1);
-  bits->size = size;
-}
-
 bitmap_t *create_bitmap(int size) {
   bitmap_t *bits = malloc(sizeof(bitmap_t));
-  if (bits) init_bitmap(bits, size);
-  bits->alloc = 1;
+
+  if (bits) {
+    memset(bits, 0, sizeof(bitmap_t));
+    bits->map = calloc(sizeof(char) * size, 1);
+    bits->size = size;
+  }
+
   return bits;
 }
 
@@ -32,12 +31,8 @@ int set_bit(bitmap_t *bits, int bit) {
 
   // Atomically update.
   char value = __sync_fetch_and_or(&bits->map[byte], (char) 1 << byte_bit);
-  if (value & 1 << byte_bit) {
-    return BITMAP_OCCUPIED_ERROR;
-  } else {
-    __sync_fetch_and_add(&bits->occupied, 1);
-    return BITMAP_SUCCESS;
-  }
+  if (value & 1 << byte_bit) return BITMAP_OCCUPIED_ERROR;
+  else return BITMAP_SUCCESS;
 }
 
 int clear_bit(bitmap_t *bits, int bit) {
@@ -46,14 +41,11 @@ int clear_bit(bitmap_t *bits, int bit) {
 
   // Atomically update.
   char value = __sync_fetch_and_and(&bits->map[byte], (char) ~(1 << byte_bit));
-  if (value & 1 << byte_bit) {
-    __sync_fetch_and_sub(&bits->occupied, 1);
-    return BITMAP_SUCCESS;
-  } else {
-    return BITMAP_VACANT_ERROR;
-  }
+  if (value & 1 << byte_bit) return BITMAP_SUCCESS;
+  else return BITMAP_VACANT_ERROR;
 }
 
+// FIXME: Not convinced this function is actually very useful.
 int check_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
   if (byte > bits->size) return BITMAP_RANGE_ERROR;
@@ -78,5 +70,5 @@ int reserve(bitmap_t *bits) {
 
 void destroy_bitmap(bitmap_t *bits) {
   free(bits->map);
-  if (bits->alloc) free(bits);
+  free(bits);
 }

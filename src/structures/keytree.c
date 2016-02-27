@@ -8,12 +8,17 @@
 #include "keytree.h"
 #include "stack.h"
 #include "list.h"
+#include "bitmap.h"
 
 /*----- Macro Definitions -----*/
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /*----- Numerical Constants -----*/
+
+#define KEYTREE_RIGHT_LOCK 0
+#define KEYTREE_LEFT_LOCK 1
+#define KEYTREE_DEL_LOCK 2
 
 #define KEYTREE_WAIT_BASE 1000000
 
@@ -23,6 +28,7 @@ typedef struct tree_node {
   void *key, *value;
   struct tree_node *left, *right, *next, *prev;
   int height, references;
+  bitmap_t *flags;
 } tree_node_t;
 
 struct keytree_iterator {
@@ -40,11 +46,10 @@ struct keytree {
 
 /*----- Local Function Declarations -----*/
 
-stack_t *internal_traverse(keytree_t *tree, void *key, int acquire);
-tree_node_t *balance(tree_node_t *subtree);
+stack_t *internal_traverse(keytree_t *tree, void *key);
+tree_node_t *balance(tree_node_t *subtree, pthread_rwlock_t *lock);
 tree_node_t *rotate_right(tree_node_t *subtree);
 tree_node_t *rotate_left(tree_node_t *subtree);
-void hook_up(keytree_t *tree, void *key);
 void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *));
 int subtree_height(tree_node_t *subtree);
 tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize);
@@ -98,67 +103,111 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
   // This whole dance is necessary so that we can avoid acquiring the write-lock
   // for as long as possible.
   stack_t *stack;
-  tree_node_t *current, *parent, *child;
+  tree_node_t *current, *parent, *inserted = create_tree_node(key, value, tree->keysize, tree->valsize);
+  pthread_rwlock_rdlock(&tree->lock);
   while (1) {
     // Traverse to find insertion point.
-    // Note that the read-lock is no longer held when this returns.
-    stack = internal_traverse(tree, key, 1);
+    stack = internal_traverse(tree, key);
 
-    // Attempt to lock insertion point.
-    pthread_rwlock_wrlock(&tree->lock);
-    child = NULL;
+    // Get our potential parent.
     int retval = stack_peek(stack, &parent);
-
-    // Check if root actually even exists. Could also fire if the root was removed
-    // while we were in between locks.
     if (retval != STACK_SUCCESS) {
-      tree->root = create_tree_node(key, value, tree->keysize, tree->valsize);
-      tree->root->next = tree->root;
-      tree->root->prev = tree->root;
-      pthread_rwlock_unlock(&tree->lock);
-      return KEYTREE_SUCCESS;
+      // This can only happen if the root node does not exist. Prepare to do a compare and swap
+      // on the root node.
+      inserted->next = inserted;
+      inserted->prev = inserted;
+
+      // Try to assign to root, and keep going if we fail.
+      if (!__sync_val_compare_and_swap(&tree->root, NULL, inserted)) {
+        // We successfully assigned to root. Probably a little weird that I'm doing this with the
+        // read lock, but this is a special case.
+        pthread_rwlock_unlock(&tree->lock);
+        destroy_stack(stack);
+        return KEYTREE_SUCCESS;
+      }
     }
 
-    // Root exists, check if we can insert.
+    // Root exists. Check if we can insert here.
     if (tree->compare(key, parent->key) > 0) {
-      child = parent->right;
+      if (set_bit(parent->flags, KEYTREE_RIGHT_LOCK) == BITMAP_SUCCESS) break;
     } else if (tree->compare(key, parent->key) < 0) {
-      child = parent->left;
+      if (set_bit(parent->flags, KEYTREE_LEFT_LOCK) == BITMAP_SUCCESS) break;
     } else {
-      // Duplicate.
-      destroy_stack(stack);
+      // Duplicate key. No insertion.
+      destroy_tree_node(inserted, tree->key_destroy, tree->val_destroy);
       pthread_rwlock_unlock(&tree->lock);
-      return KEYTREE_DUPLICATE;
+      destroy_stack(stack);
     }
-    if (!child) break;
 
-    // Someone else already inserted here. Try again...
-    pthread_rwlock_unlock(&tree->lock);
+    // Not this time. Clean up the stack and try again.
     destroy_stack(stack);
   }
 
-  // We've found and own our insertion point. Perform the insertion, rebalance the tree, and unlock.
+  // We've found our insertion point, now we need to switch our lock from read to write.
+  // We hold references to our entire insertion stack, so keytree_remove shouldn't be able to
+  // mutate anything we're using, and we've locked our insertion point, so neither should
+  // another thread using this function.
+  pthread_rwlock_unlock(&tree->lock);
+  pthread_rwlock_wrlock(&tree->lock);
+
+  // Perform the insertion and rebalance the tree.
+  tree_node_t *current_parent;
   while (stack_pop(stack, &current) == STACK_SUCCESS) {
     // Insert.
     if (tree->compare(key, current->key) > 0 && !current->right) {
-      current->right = create_tree_node(key, value, tree->keysize, tree->valsize);
+      current->right = inserted;
     } else if (tree->compare(key, current->key) < 0 && !current->left) {
-      current->left = create_tree_node(key, value, tree->keysize, tree->valsize);
+      current->left = inserted;
     }
 
     // Balance.
-    int retval = stack_peek(stack, &parent);
-    if (retval != STACK_SUCCESS) tree->root = balance(current);
-    else if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
-    else parent->left = balance(current);
+    int retval = stack_peek(stack, &current_parent);
+    if (retval != STACK_SUCCESS) tree->root = balance(current, &tree->lock);
+    else if (tree->compare(current->key, current_parent->key) > 0) current_parent->right = balance(current, &tree->lock);
+    else current_parent->left = balance(current, &tree->lock);
   }
 
   // Now that the value has been inserted into the tree, hook it into the list.
   // Unfortunately this can't easily be done during insertion as the structure
   // of the tree is still subject to change.
   // Basically I'm lazy and don't care to figure it out.
-  hook_up(tree, key);
+  // Need to start by finding either the inorder predecessor or successor.
+  tree_node_t *prev = NULL, *next = NULL;
+  if (inserted->left) {
+    // If a left child exists, inorder predecessor exists all the way to the right
+    // of it.
+    prev = inserted->left;
+    while (prev->right) prev = prev->right;
+  } else if (inserted->right) {
+    // If a right child exists, inorder successor exists all the way to the left
+    // of it.
+    next = inserted->right;
+    while (next->left) next = next->left;
+  } else {
+    // Node has no children. The fact that we got here means that we're inserting,
+    // and that the root already exists. Therefore a parent must exist for the current node,
+    // which, if it's larger, is the inorder successor, and if it's smaller is the inorder
+    // predecessor. Grab it.
+    if (tree->compare(parent->key, inserted->key) > 0) next = parent;
+    else prev = parent;
+  }
 
+  // Hook up the links.
+  if (prev) {
+    next = prev->next;
+    prev->next = inserted;
+    inserted->prev = prev;
+    inserted->next = next;
+    next->prev = inserted;
+  } else if (next) {
+    prev = next->prev;
+    next->prev = inserted;
+    inserted->next = next;
+    prev->next = inserted;
+    inserted->prev = prev;
+  }
+
+  // We're finally done. Cleanup and return.
   pthread_rwlock_unlock(&tree->lock);
   destroy_stack(stack);
 
@@ -171,7 +220,9 @@ int keytree_find(keytree_t *tree, void *key, void *valbuf) {
 
   // Perform traversal to find given key.
   int success = 0;
-  stack_t *stack = internal_traverse(tree, key, 1);
+  pthread_rwlock_rdlock(&tree->lock);
+  stack_t *stack = internal_traverse(tree, key);
+  pthread_rwlock_unlock(&tree->lock);
 
   // Read lock does not need to be held for the following comparison line.
   // The only functions that can mutate the tree are keytree_insert, and
@@ -199,53 +250,23 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
   if (!tree || !key) return KEYTREE_INVAL;
 
   // Traverse tree to find the element we want to remove.
-  tree_node_t *tmp;
-  stack_t *stack = internal_traverse(tree, key, 1);
+  tree_node_t *tmp, *removed;
+  pthread_rwlock_rdlock(&tree->lock);
+  stack_t *stack = internal_traverse(tree, key);
 
-  // FIXME: I do not believe that we need to hold the read lock for this line for
-  // the same reasons outlined in the previous function. We acquire the write lock
-  // on the following line, and if the tree is mutated in the intervening time, it
-  // was either by keytree_insert, or us. If it was keytree_insert, the tree will
-  // have been reorganized, but we only care about the structure of the tree while
-  // holding the write lock. If it's mutated by us, we'll perform a double check
-  // to make sure the node still exists.
-  // We do need to check the return value of stack_peek, though, as someone could have
-  // deleted the whole tree while we were acquiring the original read-lock.
-  int retval = stack_peek(stack, &tmp);
-  if (retval == STACK_SUCCESS && !tree->compare(tmp->key, key)) {
-    tree_node_t *removed;
-
-    // Forfeit our references to the deleted nodes, acquire write lock, and attempt
-    // to find the node in the tree again.
-    // If there is contention, and there are multiple threads trying to delete
-    // this node simulatenously, we are either the leader or a follower in this
-    // operation.
-    // If we are the leader, we will find the node in the tree on the second go,
-    // we will remove it from the tree, and we will wait for the references to hit
-    // zero to free the node.
-    // If we are a follower, we will not find the node in the tree, and will give up.
-    // We must forfeit our references before acquiring the write lock as otherwise
-    // multiple deleters could deadlock.
-    // If there are other readers in the tree, holding a reference to the node, the
-    // leader will wait until they have exited the tree to free the node.
-    // The reason for this whole complicated dance is to avoid acquiring the
-    // write-lock if the node was never in the tree in the first place, and because
-    // read-locks cannot be atomically converted into write-locks.
-    destroy_stack(stack);
-    pthread_rwlock_wrlock(&tree->lock);
-
-    // Note that we do not acquire a read lock for this traversal.
-    stack = internal_traverse(tree, key, 0);
-    retval = stack_peek(stack, &tmp);
-    if (retval == STACK_SUCCESS && !tree->compare(tmp->key, key)) {
-      // We are the leader (or there is no contention)!
-      // Remove and rebalance.
+  // Check if the key is in the tree at all.
+  int retval = stack_pop(stack, &removed);
+  if (retval == STACK_SUCCESS && !tree->compare(removed->key, key)) {
+    // As we have only acquired the write lock, there could be multiple threads attempting to remove
+    // this node at the same time. If so, we are either the leader, or a follower. Attempt to grab
+    // the delete flag for the node. If it succeeds, we are the leader and can safely remove the
+    // node. If not, we are a follower and are done.
+    if (set_bit(removed->flags, KEYTREE_DEL_LOCK) == BITMAP_SUCCESS) {
+      // We are the leader! Acquire the write lock.
       tree_node_t *parent, *current, *successor;
+      pthread_rwlock_wrlock(&tree->lock);
 
-      // We permanently release our reference to the deleted node, and remove it
-      // from the stack (will be used later for rebalancing), but not the parent
-      // yet.
-      stack_pop(stack, &removed);
+      // Get a reference to the parent if there is one.
       int parent_status = stack_peek(stack, &parent);
 
       // Figure out how much work we need to do.
@@ -330,8 +351,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
           retval = stack_peek(successor_stack, &parent);
 
           if (retval != STACK_SUCCESS) parent = successor;
-          if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
-          else parent->left = balance(current);
+          if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current, &tree->lock);
+          else parent->left = balance(current, &tree->lock);
         }
         destroy_stack(successor_stack);
 
@@ -346,9 +367,9 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       // Time to rebalance!
       while (stack_pop(stack, &current) == STACK_SUCCESS) {
         retval = stack_peek(stack, &parent);
-        if (retval != STACK_SUCCESS) tree->root = balance(current);
-        else if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current);
-        else parent->left = balance(current);
+        if (retval != STACK_SUCCESS) tree->root = balance(current, &tree->lock);
+        else if (tree->compare(current->key, parent->key) > 0) parent->right = balance(current, &tree->lock);
+        else parent->left = balance(current, &tree->lock);
       }
 
       // Update links in the list.
@@ -370,14 +391,12 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       return KEYTREE_SUCCESS;
     } else {
       // We are a follower...
-      // Nothing left to do. Leave removal up to leader (may already be done).
+      // Nothing left to do. Leave removal up to leader.
       destroy_stack(stack);
-      pthread_rwlock_unlock(&tree->lock);
       return KEYTREE_NO_SUCH_ELEMENT;
     }
   } else {
     // The element doesn't exist in the tree.
-    pthread_rwlock_unlock(&tree->lock);
     destroy_stack(stack);
     return KEYTREE_NO_SUCH_ELEMENT;
   }
@@ -397,7 +416,7 @@ keytree_iterator_t *keytree_iterate_start(keytree_t *tree, void *target_key) {
     pthread_rwlock_rdlock(&tree->lock);
     if (target_key) {
       // Find the target node.
-      stack_t *stack = internal_traverse(tree, target_key, 0);
+      stack_t *stack = internal_traverse(tree, target_key);
 
       if (stack_pop(stack, &it->curr) == STACK_EMPTY) {
         // Key does not exist in tree.
@@ -485,11 +504,10 @@ void keytree_iterate_stop(keytree_iterator_t *it) {
 
 // Tree helper functions.
 
-stack_t *internal_traverse(keytree_t *tree, void *key, int acquire) {
+stack_t *internal_traverse(keytree_t *tree, void *key) {
   stack_t *stack = create_stack(dereference_and_destroy, sizeof(tree_node_t *));
 
-  // Lock the tree for reading and perform traversal.
-  if (acquire) pthread_rwlock_rdlock(&tree->lock);
+  // Perform traversal.
   tree_node_t *current = tree->root;
   while (current) {
     int comparison = tree->compare(key, current->key);
@@ -508,23 +526,46 @@ stack_t *internal_traverse(keytree_t *tree, void *key, int acquire) {
       break;
     }
   }
-  if (acquire) pthread_rwlock_unlock(&tree->lock);
 
   return stack;
 }
 
-tree_node_t *balance(tree_node_t *subtree) {
+// FIXME: I'm currently guessing about which nodes need to be waited upon in this function based
+// on which nodes have parent changes. Revisit this if there are problems.
+// Could also deadlock. Who even knows.
+tree_node_t *balance(tree_node_t *subtree, pthread_rwlock_t *lock) {
+  tree_node_t *nodes[5];
   if (subtree_height(subtree->left) - subtree_height(subtree->right) > 1) {
     if (subtree_height(subtree->left->left) >= subtree_height(subtree->left->right)) {
+      nodes[0] = subtree;
+      nodes[1] = subtree->left;
+      nodes[2] = subtree->left->right;
+      wait_on_references(nodes, 3, lock);
       subtree = rotate_left(subtree);
     } else {
+      nodes[0] = subtree;
+      nodes[1] = subtree->left;
+      nodes[2] = subtree->left->right;
+      nodes[3] = subtree->left->right->left;
+      nodes[4] = subtree->left->right->right;
+      wait_on_references(nodes, 5, lock);
       subtree->left = rotate_right(subtree->left);
       subtree = rotate_left(subtree);
     }
   } else if (subtree_height(subtree->right) - subtree_height(subtree->left) > 1) {
     if (subtree_height(subtree->right->right) >= subtree_height(subtree->right->left)) {
+      nodes[0] = subtree;
+      nodes[1] = subtree->right;
+      nodes[2] = subtree->right->left;
+      wait_on_references(nodes, 3, lock);
       subtree = rotate_right(subtree);
     } else {
+      nodes[0] = subtree;
+      nodes[1] = subtree->right;
+      nodes[2] = subtree->right->left;
+      nodes[3] = subtree->right->left->right;
+      nodes[4] = subtree->right->left->left;
+      wait_on_references(nodes, 5, lock);
       subtree->right = rotate_left(subtree->right);
       subtree = rotate_right(subtree);
     }
@@ -536,89 +577,33 @@ tree_node_t *balance(tree_node_t *subtree) {
 }
 
 tree_node_t *rotate_right(tree_node_t *subtree) {
+  // Rotate.
   tree_node_t *right_child = subtree->right;
   subtree->right = right_child->left;
   right_child->left = subtree;
+
+  // Clear the lock on the right child if the assignment was NULL.
+  if (!subtree->right) clear_bit(subtree->flags, KEYTREE_RIGHT_LOCK);
+
+  // Rewrite heights.
   subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
   right_child->height = MAX(subtree_height(right_child->right), subtree->height) + 1;
   return right_child;
 }
 
 tree_node_t *rotate_left(tree_node_t *subtree) {
+  // Rotate.
   tree_node_t *left_child = subtree->left;
   subtree->left = left_child->right;
   left_child->right = subtree;
+
+  // Clear the lock on the left child if the assignment was NULL.
+  if (!subtree->left) clear_bit(subtree->flags, KEYTREE_LEFT_LOCK);
+
+  // Rewrite heights.
   subtree->height = MAX(subtree_height(subtree->left), subtree_height(subtree->right)) + 1;
   left_child->height = MAX(subtree_height(left_child->left), subtree->height) + 1;
   return left_child;
-}
-
-// Function hooks a just inserted node with the given key into the list.
-void hook_up(keytree_t *tree, void *key) {
-  stack_t *stack = internal_traverse(tree, key, 0);
-  tree_node_t *prev = NULL, *curr, *next = NULL;
-  stack_pop(stack, &curr);
-
-  // First try finding the inorder predecessor.
-  if (curr->left) {
-    // If a left child exists, inorder predecessor exists all the way to the right
-    // of it.
-    prev = curr->left;
-    while (prev->right) prev = prev->right;
-  } else {
-    // We may need to use it again, so duplicate the stack.
-    stack_t *copy = stack_dup(stack, free);
-
-    // If no left child exists, inorder predecessor, if it exists, is the first
-    // parent in the stack that is smaller than its child.
-    tree_node_t *child = curr, *parent;
-    while (stack_pop(copy, &parent) == STACK_SUCCESS) {
-      if (tree->compare(parent->key, child->key) < 0) {
-        // We've found it!
-        prev = parent;
-        break;
-      }
-      child = parent;
-    }
-    destroy_stack(copy);
-  }
-
-  // If we couldn't find a predecessor, we've inserted the new smallest element into
-  // the tree. Instead find the successor.
-  if (curr->right && !prev) {
-    // If a right child exists, inorder successor exists all the way to the left
-    // of it.
-    next = curr->right;
-    while (next->left) next = next->left;
-  } else if (!prev) {
-    // If no left child exists, inorder successor is the first parent in the stack
-    // that is larger than its child.
-    tree_node_t *child = curr, *parent;
-    while (stack_pop(stack, &parent) == STACK_SUCCESS) {
-      if (tree->compare(parent->key, child->key) > 0) {
-        // We've found it!
-        next = parent;
-        break;
-      }
-      child = parent;
-    }
-  }
-  destroy_stack(stack);
-
-  // Hook up the links.
-  if (prev) {
-    next = prev->next;
-    prev->next = curr;
-    curr->prev = prev;
-    curr->next = next;
-    next->prev = curr;
-  } else if (next) {
-    prev = next->prev;
-    next->prev = curr;
-    curr->next = next;
-    prev->next = curr;
-    curr->prev = prev;
-  }
 }
 
 void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
@@ -643,6 +628,7 @@ tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize) 
     node->key = malloc(keysize);
     node->value = malloc(valsize);
     node->height = 1;
+    node->flags = create_bitmap(1);
     memcpy(node->key, key, keysize);
     memcpy(node->value, value, valsize);
   }
@@ -686,6 +672,7 @@ void dereference_and_destroy(void *voidarg) {
 void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
   key_destroy(node->key);
   val_destroy(node->value);
+  destroy_bitmap(node->flags);
   free(node);
 }
 
