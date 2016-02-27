@@ -5,3 +5,4 @@ bin/*
 obj/*
 *.yml
 core.*
+vgcore.*

@@ -48,7 +48,7 @@ void hook_up(keytree_t *tree, void *key);
 void inorder_destruction(tree_node_t *subtree, pthread_rwlock_t *lock, void (*key_destroy) (void *), void (*val_destroy) (void *));
 int subtree_height(tree_node_t *subtree);
 tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize);
-void wait_on_references(tree_node_t *node, pthread_rwlock_t *lock);
+void wait_on_references(tree_node_t **nodes, int num_nodes, pthread_rwlock_t *lock);
 void dereference_and_destroy(void *voidarg);
 void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*val_destroy) (void *));
 
@@ -94,18 +94,7 @@ void keytree_destroy(keytree_t *tree) {
 int keytree_insert(keytree_t *tree, void *key, void *value) {
   if (!tree || !key || !value) return KEYTREE_INVAL;
 
-  // Check if the root node has been set.
-  pthread_rwlock_wrlock(&tree->lock);
-  if (!tree->root) {
-    tree->root = create_tree_node(key, value, tree->keysize, tree->valsize);
-    tree->root->next = tree->root;
-    tree->root->prev = tree->root;
-    pthread_rwlock_unlock(&tree->lock);
-    return KEYTREE_SUCCESS;
-  }
-  pthread_rwlock_unlock(&tree->lock);
-
-  // Spin and traverse until we lock the insertion point.
+  // Spin and traverse until we can gaurantee exclusive access to insertion point.
   // This whole dance is necessary so that we can avoid acquiring the write-lock
   // for as long as possible.
   stack_t *stack;
@@ -118,7 +107,19 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
     // Attempt to lock insertion point.
     pthread_rwlock_wrlock(&tree->lock);
     child = NULL;
-    stack_peek(stack, &parent);
+    int retval = stack_peek(stack, &parent);
+
+    // Check if root actually even exists. Could also fire if the root was removed
+    // while we were in between locks.
+    if (retval != STACK_SUCCESS) {
+      tree->root = create_tree_node(key, value, tree->keysize, tree->valsize);
+      tree->root->next = tree->root;
+      tree->root->prev = tree->root;
+      pthread_rwlock_unlock(&tree->lock);
+      return KEYTREE_SUCCESS;
+    }
+
+    // Root exists, check if we can insert.
     if (tree->compare(key, parent->key) > 0) {
       child = parent->right;
     } else if (tree->compare(key, parent->key) < 0) {
@@ -196,7 +197,6 @@ int keytree_find(keytree_t *tree, void *key, void *valbuf) {
 // until they release their references.
 int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
   if (!tree || !key) return KEYTREE_INVAL;
-  if (!tree->root) return KEYTREE_NO_SUCH_ELEMENT;
 
   // Traverse tree to find the element we want to remove.
   tree_node_t *tmp;
@@ -252,7 +252,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       int comparison = parent_status == STACK_SUCCESS ? tree->compare(key, parent->key) : 0;
       if (!removed->left && !removed->right) {
         // Easy life. Node has no children. Wait for references to hit zero and remove.
-        wait_on_references(removed, &tree->lock);
+        wait_on_references(&removed, 1, &tree->lock);
         if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = NULL;
@@ -265,7 +265,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       } else if (removed->right && !removed->left) {
         // 1 child. Need to reassign a child, but that's it.
         // Wait for references to hit zero and remove.
-        wait_on_references(removed, &tree->lock);
+        wait_on_references(&removed, 1, &tree->lock);
         if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = removed->right;
@@ -277,7 +277,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       } else if (removed->left && !removed->right) {
         // 1 child. Need to reassign a child, but that's it.
         // Wait for references to hit zero and remove.
-        wait_on_references(removed, &tree->lock);
+        wait_on_references(&removed, 1, &tree->lock);
         if (parent_status == STACK_SUCCESS) {
           // General case.
           if (comparison > 0) parent->right = removed->left;
@@ -298,8 +298,11 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
         stack_pop(successor_stack, &successor);
 
         // Alright, we have to start mutating things. Wait for references to hit
-        // zero on the removed node.
-        wait_on_references(removed, &tree->lock);
+        // zero on the removed and successor nodes.
+        tree_node_t *modified[2];
+        modified[0] = removed;
+        modified[1] = successor;
+        wait_on_references(modified, 2, &tree->lock);
 
         // Remove successor from old position in the tree and assign new children.
         retval = stack_peek(successor_stack, &tmp);
@@ -391,14 +394,14 @@ keytree_iterator_t *keytree_iterate_start(keytree_t *tree, void *target_key) {
     // Copy over the data.
     it->lock = &tree->lock;
 
+    pthread_rwlock_rdlock(&tree->lock);
     if (target_key) {
       // Find the target node.
-      stack_t *stack = internal_traverse(tree, target_key, 1);
+      stack_t *stack = internal_traverse(tree, target_key, 0);
 
       if (stack_pop(stack, &it->curr) == STACK_EMPTY) {
         // Key does not exist in tree.
         destroy_stack(stack);
-        pthread_rwlock_unlock(&tree->lock);
         free(it);
         return NULL;
       }
@@ -407,7 +410,6 @@ keytree_iterator_t *keytree_iterate_start(keytree_t *tree, void *target_key) {
       destroy_stack(stack);
     } else {
       // User didn't provide a target key, find smallest node and start there.
-      pthread_rwlock_rdlock(&tree->lock);
       tree_node_t *current = tree->root;
       while (current->left) current = current->left;
       it->curr = current;
@@ -428,8 +430,6 @@ keytree_iterator_t *keytree_iterate_start(keytree_t *tree, void *target_key) {
 }
 
 // Function copies data out for the current node, then moves forward.
-// FIXME: Could probably be done without locking. Reference counts should be enough to
-// protect access. Revisit.
 int keytree_iterate_next(keytree_iterator_t *it, void *keybuf, void *valbuf) {
   if (!it) return KEYTREE_INVAL;
   else if (!it->curr) return KEYTREE_NO_SUCH_ELEMENT;
@@ -452,8 +452,6 @@ int keytree_iterate_next(keytree_iterator_t *it, void *keybuf, void *valbuf) {
 }
 
 // Function copies data out for the current node, then moves back.
-// FIXME: Could probably be done without locking. Reference counts should be enough to
-// protect access. Revisit.
 int keytree_iterate_prev(keytree_iterator_t *it, void *keybuf, void *valbuf) {
   if (!it) return KEYTREE_INVAL;
   else if (!it->curr) return KEYTREE_NO_SUCH_ELEMENT;
@@ -654,18 +652,26 @@ tree_node_t *create_tree_node(void *key, void *value, int keysize, int valsize) 
 
 // Function blocks until the given node's references have hit zero.
 // Expects to be called with the write-lock held. Returns with it still held.
-void wait_on_references(tree_node_t *node, pthread_rwlock_t *lock) {
+void wait_on_references(tree_node_t **nodes, int num_nodes, pthread_rwlock_t *lock) {
   struct timespec ts;
-  for (int i = 0; node->references; i++) {
+  for (int i = 0; 1; i++) {
+    // Figure out if any references are still held.
+    int safe = 1;
+    for (int j = 0; j < num_nodes; j++) if (nodes[j]->references) safe = 0;
+    if (safe) break;
+
+    // References are still held. Get ready to sleep.
     pthread_rwlock_unlock(lock);
     if (i > 10) i = 10;
 
-    // Figure out how long to sleep for.
+    // Figure out how long to sleep for. Exponential backoff with a cap of 1 second.
     int factor = 1 << i;
     unsigned long long total_wait = KEYTREE_WAIT_BASE * factor;
     ts.tv_sec = total_wait / 1000000000;
     ts.tv_nsec = total_wait % 1000000000;
     nanosleep(&ts, NULL);
+
+    // Lock and reinitialize.
     pthread_rwlock_wrlock(lock);
   }
 }
