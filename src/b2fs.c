@@ -33,6 +33,7 @@
 
 /*----- Local Includes -----*/
 
+#include "logger.h"
 #include "b64/cencode.h"
 #include "jsmn/jsmn.h"
 #include "structures/hash.h"
@@ -40,36 +41,6 @@
 #include "structures/keytree.h"
 
 /*----- Macro Declarations -----*/
-
-#ifdef DEBUG
-
-#define write_log(level, ...)                                                 \
-  do {                                                                        \
-    printf(__VA_ARGS__);                                                      \
-  } while (0);
-
-#elif INFO
-
-#define write_log(level, ...)                                                 \
-  do {                                                                        \
-    if (level == LEVEL_INFO) printf(__VA_ARGS__)                              \
-    else if (level == LEVEL_ERROR) fprintf(stderr, __VA_ARGS__);              \
-  } while (0);
-
-#else
-
-#define write_log(level, ...)                                                 \
-  do {                                                                        \
-    if (level == LEVEL_ERROR) fprintf(stderr, __VA_ARGS__);                   \
-  } while (0);
-
-#endif
-
-#define LOG_KEY(data, key, context)                                           \
-  do {                                                                        \
-    write_log(LEVEL_DEBUG, "B2FS: Encountered unexpected key in %s: %.*s\n",  \
-        context, key->end - key->start, data + key->start);                   \
-  } while (0);
 
 /*----- Type Declarations -----*/
 
@@ -94,12 +65,6 @@ typedef struct b2fs_state {
   char down_url[B2FS_TOKEN_LEN], bucket[B2FS_SMALL_GENERIC_BUFFER];
   hash_t *fs_cache;
 } b2fs_state_t;
-
-typedef enum b2fs_loglevel {
-  LEVEL_DEBUG,
-  LEVEL_INFO,
-  LEVEL_ERROR
-} b2fs_loglevel_t;
 
 /*----- Local Function Declarations -----*/
 

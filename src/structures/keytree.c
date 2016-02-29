@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <time.h>
+#include "../logger.h"
 #include "keytree.h"
 #include "stack.h"
 #include "list.h"
@@ -102,11 +103,15 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
   // Spin and traverse until we can gaurantee exclusive access to insertion point.
   // This whole dance is necessary so that we can avoid acquiring the write-lock
   // for as long as possible.
+  pthread_t thread_id = pthread_self();
+  write_log(LEVEL_DEBUG, "keytree_insert: Insert called for key: %s...\n", (char *) key);
   stack_t *stack;
   tree_node_t *current, *parent, *inserted = create_tree_node(key, value, tree->keysize, tree->valsize);
+  write_log(LEVEL_DEBUG, "keytree_insert: Acquiring read-lock...\n");
   pthread_rwlock_rdlock(&tree->lock);
   while (1) {
     // Traverse to find insertion point.
+    write_log(LEVEL_DEBUG, "keytree_insert: Performing traversal...\n");
     stack = internal_traverse(tree, key);
 
     // Get our potential parent.
@@ -118,9 +123,11 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
       inserted->prev = inserted;
 
       // Try to assign to root, and keep going if we fail.
+      write_log(LEVEL_DEBUG, "keytree_insert: Root does not exist, attempting replacement...\n");
       if (!__sync_val_compare_and_swap(&tree->root, NULL, inserted)) {
         // We successfully assigned to root. Probably a little weird that I'm doing this with the
         // read lock, but this is a special case.
+        write_log(LEVEL_DEBUG, "keytree_insert: Inserted as root...\n");
         pthread_rwlock_unlock(&tree->lock);
         destroy_stack(stack);
         return KEYTREE_SUCCESS;
@@ -129,17 +136,21 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
 
     // Root exists. Check if we can insert here.
     if (tree->compare(key, parent->key) > 0) {
+      log_tree_key(parent, "keytree_insert: Attempting to lock right child of parent");
       if (set_bit(parent->flags, KEYTREE_RIGHT_LOCK) == BITMAP_SUCCESS) break;
     } else if (tree->compare(key, parent->key) < 0) {
+      log_tree_key(parent, "keytree_insert: Attempting to lock left child of parent");
       if (set_bit(parent->flags, KEYTREE_LEFT_LOCK) == BITMAP_SUCCESS) break;
     } else {
       // Duplicate key. No insertion.
+      write_log(LEVEL_DEBUG, "keytree_insert: Insert was a duplicate...\n");
       destroy_tree_node(inserted, tree->key_destroy, tree->val_destroy);
       pthread_rwlock_unlock(&tree->lock);
       destroy_stack(stack);
     }
 
     // Not this time. Clean up the stack and try again.
+    write_log(LEVEL_DEBUG, "keytree_insert: Insertion failed, running again...\n");
     destroy_stack(stack);
   }
 
@@ -147,6 +158,7 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
   // We hold references to our entire insertion stack, so keytree_remove shouldn't be able to
   // mutate anything we're using, and we've locked our insertion point, so neither should
   // another thread using this function.
+  write_log(LEVEL_DEBUG, "keytree_insert: Switching locks...\n");
   pthread_rwlock_unlock(&tree->lock);
   pthread_rwlock_wrlock(&tree->lock);
 
@@ -207,6 +219,9 @@ int keytree_insert(keytree_t *tree, void *key, void *value) {
     inserted->prev = prev;
   }
 
+  // Node is fully inserted in the tree. Increase count.
+  tree->size++;
+
   // We're finally done. Cleanup and return.
   pthread_rwlock_unlock(&tree->lock);
   destroy_stack(stack);
@@ -264,6 +279,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
     if (set_bit(removed->flags, KEYTREE_DEL_LOCK) == BITMAP_SUCCESS) {
       // We are the leader! Acquire the write lock.
       tree_node_t *parent, *current, *successor;
+      pthread_rwlock_unlock(&tree->lock);
       pthread_rwlock_wrlock(&tree->lock);
 
       // Get a reference to the parent if there is one.
@@ -378,7 +394,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       next->prev = prev;
 
       // All references to the node have been removed from the tree. Release
-      // references and lock.
+      // references, decrease size, and release lock.
+      tree->size--;
       pthread_rwlock_unlock(&tree->lock);
       destroy_stack(stack);
 
@@ -535,37 +552,52 @@ stack_t *internal_traverse(keytree_t *tree, void *key) {
 // Could also deadlock. Who even knows.
 tree_node_t *balance(tree_node_t *subtree, pthread_rwlock_t *lock) {
   tree_node_t *nodes[5];
+  int num_nodes = 0;
   if (subtree_height(subtree->left) - subtree_height(subtree->right) > 1) {
     if (subtree_height(subtree->left->left) >= subtree_height(subtree->left->right)) {
-      nodes[0] = subtree;
-      nodes[1] = subtree->left;
-      nodes[2] = subtree->left->right;
-      wait_on_references(nodes, 3, lock);
+      // We need to wait to rotates nodes whose parents will change until there are no
+      // references held to those nodes. Otherwise concurrent inserts and removes
+      // could clobber each other.
+      nodes[num_nodes++] = subtree;
+      nodes[num_nodes++] = subtree->left;
+      if (subtree->left->right) nodes[num_nodes++] = subtree->left->right;
+
+      // Wait on references and perform the rotation.
+      wait_on_references(nodes, num_nodes, lock);
       subtree = rotate_left(subtree);
     } else {
-      nodes[0] = subtree;
-      nodes[1] = subtree->left;
-      nodes[2] = subtree->left->right;
-      nodes[3] = subtree->left->right->left;
-      nodes[4] = subtree->left->right->right;
-      wait_on_references(nodes, 5, lock);
+      // Figure out which nodes to wait on.
+      nodes[num_nodes++] = subtree;
+      nodes[num_nodes++] = subtree->left;
+      nodes[num_nodes++] = subtree->left->right;
+      if (subtree->left->right->left) nodes[num_nodes++] = subtree->left->right->left;
+      if (subtree->left->right->right) nodes[num_nodes++] = subtree->left->right->right;
+
+      // Wait on references and perform the rotation.
+      wait_on_references(nodes, num_nodes, lock);
       subtree->left = rotate_right(subtree->left);
       subtree = rotate_left(subtree);
     }
   } else if (subtree_height(subtree->right) - subtree_height(subtree->left) > 1) {
     if (subtree_height(subtree->right->right) >= subtree_height(subtree->right->left)) {
-      nodes[0] = subtree;
-      nodes[1] = subtree->right;
-      nodes[2] = subtree->right->left;
-      wait_on_references(nodes, 3, lock);
+      // Figure out which nodes to wait on.
+      nodes[num_nodes++] = subtree;
+      nodes[num_nodes++] = subtree->right;
+      if (subtree->right->left) nodes[num_nodes++] = subtree->right->left;
+
+      // Wait on references and perform the rotation.
+      wait_on_references(nodes, num_nodes, lock);
       subtree = rotate_right(subtree);
     } else {
-      nodes[0] = subtree;
-      nodes[1] = subtree->right;
-      nodes[2] = subtree->right->left;
-      nodes[3] = subtree->right->left->right;
-      nodes[4] = subtree->right->left->left;
-      wait_on_references(nodes, 5, lock);
+      // Figure out which nodes to wait on.
+      nodes[num_nodes++] = subtree;
+      nodes[num_nodes++] = subtree->right;
+      nodes[num_nodes++] = subtree->right->left;
+      if (subtree->right->left->right) nodes[num_nodes++] = subtree->right->left->right;
+      if (subtree->right->left->left) nodes[num_nodes++] = subtree->right->left->left;
+
+      // Wait on references and perform the rotation.
+      wait_on_references(nodes, num_nodes, lock);
       subtree->right = rotate_left(subtree->right);
       subtree = rotate_right(subtree);
     }
