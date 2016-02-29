@@ -338,7 +338,8 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
     next->prev = prev;
 
     // All references to the node have been removed from the tree. Release
-    // references and lock.
+    // references, decrease size, and lock.
+    tree->size--;
     pthread_rwlock_unlock(&tree->lock);
     destroy_stack(stack);
 
