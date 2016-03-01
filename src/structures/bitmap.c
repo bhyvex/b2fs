@@ -19,7 +19,7 @@ struct bitmap {
 
 /*----- Local Function Definitions -----*/
 
-int reallocate(bitmap_t *map);
+int reallocate(bitmap_t *map, int size);
 
 /*----- Function Implementations -----*/
 
@@ -38,7 +38,7 @@ bitmap_t *create_bitmap(int size) {
 
 int set_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
-  if (byte > bits->size) reallocate(bits);
+  if (byte > bits->size) reallocate(bits, byte);
 
   // Acquire read lock to allow for reallocations.
   pthread_rwlock_rdlock(&bits->lock);
@@ -57,7 +57,7 @@ int set_bit(bitmap_t *bits, int bit) {
 
 int clear_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
-  if (byte > bits->size) reallocate(bits);
+  if (byte > bits->size) reallocate(bits, byte);
 
   // Acquire read-lock to allow for reallocations
   pthread_rwlock_rdlock(&bits->lock);
@@ -76,7 +76,7 @@ int clear_bit(bitmap_t *bits, int bit) {
 
 int check_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
-  if (byte > bits->size) reallocate(bits);
+  if (byte > bits->size) reallocate(bits, byte);
 
   // Acquire read-lock to allow for reallocations
   pthread_rwlock_rdlock(&bits->lock);
@@ -114,12 +114,19 @@ void destroy_bitmap(bitmap_t *bits) {
   free(bits);
 }
 
-int reallocate(bitmap_t *map) {
+int reallocate(bitmap_t *map, int size) {
   pthread_rwlock_wrlock(&map->lock);
+
+  // Now that we're holding the write-lock, double check things.
+  if (map->size > size) {
+    // We were called multiple times, job is already done. Return.
+    pthread_rwlock_unlock(&map->lock);
+    return BITMAP_SUCCESS;
+  }
 
   // Figure out the next allocation size.
   int powers = 1;
-  while (powers < map->size) powers <<= 1;
+  while (powers < size) powers <<= 1;
 
   // Perform reallocation.
   void *tmp = realloc(map->map, sizeof(char) * powers);
@@ -128,4 +135,6 @@ int reallocate(bitmap_t *map) {
   map->map = tmp;
 
   pthread_rwlock_unlock(&map->lock);
+
+  return BITMAP_SUCCESS;
 }
