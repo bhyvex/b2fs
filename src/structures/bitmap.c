@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <limits.h>
 #include "bitmap.h"
 
 /*----- Numerical Constants -----*/
@@ -38,7 +39,7 @@ bitmap_t *create_bitmap(int size) {
 
 int set_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
-  if (byte > bits->size) reallocate(bits, byte);
+  if (byte >= bits->size) reallocate(bits, byte);
 
   // Acquire read lock to allow for reallocations.
   pthread_rwlock_rdlock(&bits->lock);
@@ -57,7 +58,7 @@ int set_bit(bitmap_t *bits, int bit) {
 
 int clear_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
-  if (byte > bits->size) reallocate(bits, byte);
+  if (byte >= bits->size) reallocate(bits, byte);
 
   // Acquire read-lock to allow for reallocations
   pthread_rwlock_rdlock(&bits->lock);
@@ -76,7 +77,7 @@ int clear_bit(bitmap_t *bits, int bit) {
 
 int check_bit(bitmap_t *bits, int bit) {
   int byte = bit / 8, byte_bit = bit % 8;
-  if (byte > bits->size) reallocate(bits, byte);
+  if (byte >= bits->size) reallocate(bits, byte);
 
   // Acquire read-lock to allow for reallocations
   pthread_rwlock_rdlock(&bits->lock);
@@ -89,23 +90,15 @@ int check_bit(bitmap_t *bits, int bit) {
 int reserve(bitmap_t *bits) {
   int found = 0, broken = 0;
 
-  // Acquire read-lock to allow for reallocations.
-  pthread_rwlock_rdlock(&bits->lock);
-
-  for (int byte = 0; byte < bits->size; byte++) {
-    for (int bit = 0; bit < 8; bit++) {
-      char value = __sync_fetch_and_or(&bits->map[byte], (char) 1 << bit);
-      if (!(value & 1 << bit)) {
-        found = (8 * byte) + bit;
-        broken = 1;
-        break;
-      }
+  // Iterate until we find an open slot, or we overflow.
+  for (unsigned int index = 0; index < UINT_MAX; index++) {
+    if (set_bit(bits, index) == BITMAP_SUCCESS) {
+      pthread_rwlock_unlock(&bits->lock);
+      return index;
     }
-    if (broken) break;
   }
 
-  pthread_rwlock_unlock(&bits->lock);
-  return broken ? found : BITMAP_FULL_ERROR;
+  return BITMAP_FULL_ERROR;
 }
 
 void destroy_bitmap(bitmap_t *bits) {
@@ -126,13 +119,14 @@ int reallocate(bitmap_t *map, int size) {
 
   // Figure out the next allocation size.
   int powers = 1;
-  while (powers < size) powers <<= 1;
+  while (powers <= size) powers <<= 1;
 
   // Perform reallocation.
   void *tmp = realloc(map->map, sizeof(char) * powers);
   if (!tmp) return BITMAP_NOMEM_ERROR;
-  memset(tmp + map->size, 0, powers - map->size);
+  memset((char *) tmp + map->size, 0, powers - map->size);
   map->map = tmp;
+  map->size = powers;
 
   pthread_rwlock_unlock(&map->lock);
 

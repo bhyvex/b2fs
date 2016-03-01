@@ -601,7 +601,7 @@ int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
 }
 
 char **split_path(char *path) {
-  char **parts = malloc(sizeof(char *) * B2FS_SMALL_GENERIC_BUFFER), **strtok_ptr;
+  char **parts = malloc(sizeof(char *) * B2FS_SMALL_GENERIC_BUFFER), **strtok_ptr = NULL;
   int size = B2FS_SMALL_GENERIC_BUFFER, counter = 0;
 
   // Iterate across string, reallocating as we go, and store token pointers.

@@ -35,6 +35,7 @@ array_t *create_array(int elem_size, void (*destruct) (void *)) {
     arr->size = ARRAY_INIT_LENGTH;
     arr->count = 0;
     arr->elem_size = elem_size;
+    arr->destruct = destruct;
     pthread_rwlock_init(&arr->realloc_lock, NULL);
   }
 
@@ -44,7 +45,7 @@ array_t *create_array(int elem_size, void (*destruct) (void *)) {
 // Function is responsible for inserting the given data at the specified
 // index. If the underlying array is not large enough, apply exponential reallocation
 // until it is.
-int insert(array_t *arr, int index, void *data) {
+int array_insert(array_t *arr, int index, void *data) {
   // No need to hold lock for this check. Array size increases monotonically, so
   // if the check passes, array is at least large enough for the operation, and
   // if a reallocation is in progress, the insertion will be halted upon attempting
@@ -62,9 +63,7 @@ int insert(array_t *arr, int index, void *data) {
       // Reallocate.
       void *tmp = realloc(arr->storage, sizeof(arr->elem_size) * newsize);
       if (tmp) {
-        // Allocation succeeded. Initialize all new memory to zero to allow for
-        // explicit NULL checks.
-        memset(tmp + arr->size, 0, (newsize - arr->size) * arr->elem_size);
+        // Memory allocation succeeded.
         arr->storage = tmp;
         arr->size = newsize;
       } else {
@@ -82,7 +81,7 @@ int insert(array_t *arr, int index, void *data) {
   pthread_rwlock_rdlock(&arr->realloc_lock);
   if (set_bit(arr->lock_map, index) == BITMAP_SUCCESS) {
     // We are the only one inserting this entry. Copy it over.
-    memcpy((char *) arr->storage + index, data, arr->elem_size);
+    memcpy((char *) arr->storage + (index * arr->elem_size), data, arr->elem_size);
 
     // Set the corresponding bit so that it can be seen by others.
     set_bit(arr->present_map, index);
@@ -90,6 +89,7 @@ int insert(array_t *arr, int index, void *data) {
     // Increase the counter.
     __sync_fetch_and_add(&arr->count, 1);
     pthread_rwlock_unlock(&arr->realloc_lock);
+    return ARRAY_SUCCESS;
   } else {
     // Someone else is inserting this entry.
     pthread_rwlock_unlock(&arr->realloc_lock);
@@ -97,19 +97,19 @@ int insert(array_t *arr, int index, void *data) {
   }
 }
 
-int push(array_t *arr, void *data) {
+int array_push(array_t *arr, void *data) {
   // Array count member is only guarantee eventual consistency, might not be split-second
   // accurate. As such, start at the current array size and keep trying to insert until
   // it succeeds.
   int success = ARRAY_OCCUPIED_ERROR;
-  for (int i = arr->count; success != ARRAY_SUCCESS && success != ARRAY_NOMEM_ERROR; i++) success = insert(arr, i, data);
+  for (int i = arr->count; success != ARRAY_SUCCESS && success != ARRAY_NOMEM_ERROR; i++) success = array_insert(arr, i, data);
 
   // Could return either ARRAY_SUCCESS or ARRAY_NOMEM_ERROR.
   return success;
 }
 
 // Function is responsible for getting the data at a specific index. 
-int retrieve(array_t *arr, int index, void *buf) {
+int array_retrieve(array_t *arr, int index, void *buf) {
   pthread_rwlock_rdlock(&arr->realloc_lock);
 
   // Check if the index is in bounds.
@@ -119,7 +119,7 @@ int retrieve(array_t *arr, int index, void *buf) {
     // memory. Copy out the value in the slot first, then check if the corresponding
     // present bit is still set. If so, the value we copied must be valid, if not,
     // not.
-    memcpy(buf, (char *) arr->storage + index, arr->elem_size);
+    memcpy(buf, (char *) arr->storage + (index * arr->elem_size), arr->elem_size);
     if (check_bit(arr->present_map, index)) {
       pthread_rwlock_unlock(&arr->realloc_lock);
       return ARRAY_SUCCESS;
@@ -136,7 +136,7 @@ int retrieve(array_t *arr, int index, void *buf) {
 }
 
 // Function empties a specific index and returns the contained data.
-int clear(array_t *arr, int index) {
+int array_clear(array_t *arr, int index) {
   pthread_rwlock_rdlock(&arr->realloc_lock);
 
   // If this passes, we are the only one removing this, insertions cannot occur
@@ -145,7 +145,7 @@ int clear(array_t *arr, int index) {
   if (clear_bit(arr->present_map, index) == BITMAP_SUCCESS) {
     // Copy value out so the user can't screw up something in our address space.
     void *voidbuf = malloc(arr->elem_size);
-    memcpy(voidbuf, (char *) arr->storage + index, arr->elem_size);
+    memcpy(voidbuf, (char *) arr->storage + (index * arr->elem_size), arr->elem_size);
     arr->destruct(voidbuf);
     free(voidbuf);
 
@@ -157,13 +157,14 @@ int clear(array_t *arr, int index) {
     pthread_rwlock_unlock(&arr->realloc_lock);
     return ARRAY_SUCCESS;
   } else {
+    pthread_rwlock_unlock(&arr->realloc_lock);
     return ARRAY_UNOCCUPIED_ERROR;
   }
 }
 
 // Function is responsible for destroying an array struct and all associated
 // data.
-void destroy_array(array_t *arr) {
+void array_destroy(array_t *arr) {
   // Acquire the write-lock to ensure nobody is using this array.
   pthread_rwlock_wrlock(&arr->realloc_lock);
 
@@ -193,4 +194,8 @@ void destroy_array(array_t *arr) {
   
   // Finish up.
   free(arr);
+}
+
+int array_count(array_t *arr) {
+  return arr->count;
 }

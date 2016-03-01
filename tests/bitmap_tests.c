@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
   // Start up the threads.
   for (int i = 0; i < num_threads; i++) {
     thread_bits[i] = malloc(sizeof(int) * (ceil(map_size / (double) num_threads)));
-    memset(thread_bits[i], -1, sizeof(int) * (ceil(map_size / (double) num_threads)));
+    memset(thread_bits[i], BITMAP_FULL_ERROR, sizeof(int) * (ceil(map_size / (double) num_threads)));
     args[i] = (voidargs_t) {map, thread_bits[i], map_size, num_threads};
     pthread_create(&threads[i], NULL, make_reservations, &args[i]);
   }
@@ -65,10 +65,9 @@ int main(int argc, char **argv) {
     // Iterate across returned bits, make sure they're all set in the map, and make
     // sure they're also unique.
     for (int j = 0; j < ceil(map_size / (double) num_threads); j++) {
-      if (bits[j] != -1) {
-        assert(check_bit(map, bits[j]));
-        assert(set_bit(double_check, bits[j]) == BITMAP_SUCCESS);
-      }
+      assert(bits[j] != BITMAP_FULL_ERROR);
+      assert(check_bit(map, bits[j]));
+      assert(set_bit(double_check, bits[j]) == BITMAP_SUCCESS);
     }
   }
 

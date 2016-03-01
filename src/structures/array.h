@@ -15,10 +15,12 @@ typedef struct array array_t;
 /*----- Array Functions -----*/
 
 array_t *create_array(int elem_size, void (*destruct) (void *));
-int insert(array_t *arr, int index, void *data);
-int push(array_t *arr, void *data);
-int retrieve(array_t *arr, int index, void *buf);
-int clear(array_t *arr, int index);
-void destroy_array(array_t *arr);
+int array_insert(array_t *arr, int index, void *data);
+int array_push(array_t *arr, void *data);
+int array_retrieve(array_t *arr, int index, void *buf);
+int array_clear(array_t *arr, int index);
+void array_destroy(array_t *arr);
+
+int array_count(array_t *arr);
 
 #endif

@@ -13,7 +13,8 @@
 /*----- Type Declarations -----*/
 
 typedef struct voidargs {
-  int num_operations, strlen, seed;
+  int num_operations, strlen;
+  unsigned int seed;
   keytree_t *tree;
   char **output;
 } voidargs_t;
@@ -96,7 +97,8 @@ void *build_tree(void *voidargs) {
   voidargs_t *args = voidargs;
 
   // Get arguments.
-  int num_operations = args->num_operations, strlens = args->strlen, seed = args->seed;
+  int num_operations = args->num_operations, strlens = args->strlen;
+  unsigned int seed = args->seed;
   keytree_t *tree = args->tree;
   char **output = args->output;
 
