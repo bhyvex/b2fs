@@ -7,7 +7,7 @@
 #define BITMAP_FULL_ERROR -0x01
 #define BITMAP_OCCUPIED_ERROR -0x02
 #define BITMAP_VACANT_ERROR -0x04
-#define BITMAP_RANGE_ERROR -0x08
+#define BITMAP_NOMEM_ERROR -0x08
 
 /*----- Type Declarations -----*/
 

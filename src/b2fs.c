@@ -274,8 +274,8 @@ int main(int argc, char **argv) {
   // We are authenticated and have a valid token. Start up FUSE.
   strcpy(b2_info.bucket, bucket);
   b2_info.exclusive = exclusive;
-  argv[0] = mount_point;
-  return fuse_main(1, argv, &mappings, &b2_info);
+  argv[1] = mount_point;
+  return fuse_main(2, argv, &mappings, &b2_info);
 }
 
 // TODO: Implement this function.
