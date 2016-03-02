@@ -118,6 +118,6 @@ void *dequeue(void *voidargs) {
 }
 
 void destruct(void *voidarg) {
-  free(voidarg);
+  (void) voidarg;
   __sync_fetch_and_add(&destruct_count, 1);
 }

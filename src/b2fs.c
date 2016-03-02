@@ -341,14 +341,14 @@ void *b2fs_init(struct fuse_conn_info *info) {
                 write_log(LEVEL_DEBUG, "B2FS: Failed to allocate enough tokens for initial fs caching...\n");
                 write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
                 if (tokens) free(tokens);
-                destroy_hash(state->fs_cache);
+                hash_destroy(state->fs_cache);
                 fuse_exit(fuse_get_context()->fuse);
               }
               tokens = tmp;
             } else if (token_count == JSMN_ERROR_INVAL || token_count == JSMN_ERROR_PART) {
               write_log(LEVEL_ERROR, "B2FS: B2 returned an invalid response during startup.\n");
               if (tokens) free(tokens);
-              destroy_hash(state->fs_cache);
+              hash_destroy(state->fs_cache);
               fuse_exit(fuse_get_context()->fuse);
             }
           }
@@ -589,7 +589,7 @@ void destroy_hash_entry(void *voidarg) {
   b2fs_hash_entry_t *entry = voidarg;
   
   // Identify entry type and destroy.
-  if (entry->type == TYPE_DIRECTORY) destroy_hash(entry->directory);
+  if (entry->type == TYPE_DIRECTORY) hash_destroy(entry->directory);
   else destroy_file_entry(&entry->file);
 }
 

@@ -278,19 +278,22 @@ void destroy_list(list_t *lst) {
 // Function is responsible for creating a list node struct.
 list_node_t *create_list_node(void *data, int elem_len) {
   list_node_t *node = malloc(sizeof(list_node_t));
-  void *data_cpy = malloc(elem_len);
 
-  if (node && data_cpy) {
-    node->data = data_cpy;
-    memcpy(node->data, data, elem_len);
-    node->references = 0;
-    node->next = NULL;
-    node->prev = NULL;
-  } else if (!data_cpy) {
+  if (node) {
+    node->data = malloc(elem_len);
+    if (node->data) {
+      memcpy(node->data, data, elem_len);
+      node->references = 0;
+      node->next = NULL;
+      node->prev = NULL;
+    } else {
+      free(node->data);
+      free(node);
+      node = NULL;
+    }
+  } else {
     free(node);
     node = NULL;
-  } else {
-    free(data_cpy);
   }
 
   return node;
@@ -313,5 +316,6 @@ void destroy_list_node(list_node_t *node, pthread_rwlock_t *lock, void (*destruc
     pthread_rwlock_wrlock(lock);
   }
   destruct(node->data);
+  free(node->data);
   free(node);
 }

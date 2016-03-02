@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
   }
 
   // Check that all destructors fire.
-  destroy_hash(hash);
+  hash_destroy(hash);
   assert(!insertion_count);
 
   // Hash works. Clean up and return.

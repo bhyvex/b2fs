@@ -17,12 +17,11 @@ typedef struct hash hash_t;
 /*----- Hash Functions -----*/
 
 hash_t *create_hash(int elem_size, void (*destruct) (void *));
-int init_hash(hash_t *table, void (*destruct) (void *));
 int hash_put(hash_t *table, char *key, void *data);
 int hash_get(hash_t *table, char *key, void *buf);
 int hash_drop(hash_t *table, char *key);
 char **hash_keys(hash_t *table);
 void hash_freeze(hash_t *table);
-void destroy_hash(hash_t *table);
+void hash_destroy(hash_t *table);
 
 #endif
