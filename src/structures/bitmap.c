@@ -88,8 +88,6 @@ int check_bit(bitmap_t *bits, int bit) {
 }
 
 int reserve(bitmap_t *bits) {
-  int found = 0, broken = 0;
-
   // Iterate until we find an open slot, or we overflow.
   for (unsigned int index = 0; index < UINT_MAX; index++) {
     if (set_bit(bits, index) == BITMAP_SUCCESS) {

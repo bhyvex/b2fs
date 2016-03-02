@@ -591,8 +591,8 @@ void dereference_and_destroy(void *voidarg) {
 
 // Function takes care of destroying a tree node.
 void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*val_destroy) (void *)) {
-  key_destroy(node->key);
-  val_destroy(node->value);
+  if (key_destroy) key_destroy(node->key);
+  if (val_destroy) val_destroy(node->value);
   free(node);
 }
 

@@ -315,7 +315,7 @@ void destroy_list_node(list_node_t *node, pthread_rwlock_t *lock, void (*destruc
     nanosleep(&ts, NULL);
     pthread_rwlock_wrlock(lock);
   }
-  destruct(node->data);
+  if (destruct) destruct(node->data);
   free(node->data);
   free(node);
 }

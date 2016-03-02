@@ -146,7 +146,7 @@ int array_clear(array_t *arr, int index) {
     // Copy value out so the user can't screw up something in our address space.
     void *voidbuf = malloc(arr->elem_size);
     memcpy(voidbuf, (char *) arr->storage + (index * arr->elem_size), arr->elem_size);
-    arr->destruct(voidbuf);
+    if (arr->destruct) arr->destruct(voidbuf);
     free(voidbuf);
 
     // Clear the insert lock so the slot can be used again.
@@ -174,7 +174,7 @@ void array_destroy(array_t *arr) {
     if (clear_bit(arr->present_map, i) == BITMAP_SUCCESS) {
       // Entry exists in the array. Get rid of it. Once again, copy it out.
       memcpy(voidbuf, (char *) arr->storage + i, arr->elem_size);
-      arr->destruct(voidbuf);
+      if (arr->destruct) arr->destruct(voidbuf);
 
       // This wouldn't be strictly necessary since we're eventually going to destroy
       // the array, but oh well.

@@ -37,11 +37,6 @@ void destroy_hash_node(hash_node_t *node, void (*destruct) (void *));
 
 /*----- Hash Functions -----*/
 
-int setup_hash(hash_t *table, void (*destruct) (void *)) {
-  // Allocate table with calloc to allow for NULL checks.
-  return 0;
-}
-
 // Function handles creation of a hash struct.
 hash_t *create_hash(int elem_size, void (*destruct) (void *)) {
   hash_t *table = malloc(sizeof(hash_t));
@@ -273,7 +268,7 @@ void hash_freeze(hash_t *table) {
 }
 
 // Function handles the destruction of hash struct.
-void destroy_hash(hash_t *table) {
+void hash_destroy(hash_t *table) {
   // Verify parameters.
   if (!table) return;
 
@@ -399,7 +394,7 @@ void destroy_hash_chain(hash_node_t *head, void (*destruct) (void *)) {
 // Function handles the destruction of a specific hash_node struct.
 void destroy_hash_node(hash_node_t *node, void (*destruct) (void *)) {
   free(node->key);
-  destruct(node->data);
+  if (destruct) destruct(node->data);
   free(node->data);
   free(node);
 }

@@ -40,6 +40,7 @@
 #include "b64/cencode.h"
 #include "jsmn/jsmn.h"
 #include "structures/hash.h"
+#include "structures/array.h"
 #include "structures/bitmap.h"
 #include "structures/keytree.h"
 
@@ -176,16 +177,21 @@ int main(int argc, char **argv) {
   b2_account_t account;
   b2fs_state_t b2_info;
   char *config = "b2fs.yml", *mount_point = NULL, *bucket = NULL;
+  char *debug = "-d", *single_threaded = "-s";
   struct option long_options[] = {
     {"bucket", required_argument, 0, 'b'},
     {"config", required_argument, 0, 'c'},
+    {"debug", no_argument, 0, 'd'},
     {"exclusive", no_argument, 0, 'e'},
     {"mount", required_argument, 0, 'm'},
+    {"single-threaded", no_argument, 0, 's'},
     {0, 0, 0, 0}
   };
+  array_t *fuse_options = create_array(sizeof(char *), NULL);
 
   // Create FUSE function mapping.
   struct fuse_operations mappings = {
+    .init       = b2fs_init,
     .getattr    = b2fs_getattr,
     .readlink   = b2fs_readlink,
     .opendir    = b2fs_opendir,
@@ -212,7 +218,7 @@ int main(int argc, char **argv) {
   };
 
   // Get CLI options.
-  while ((c = getopt_long(argc, argv, "c:m:", long_options, &index)) != -1) {
+  while ((c = getopt_long(argc, argv, "b:c:dem:s", long_options, &index)) != -1) {
     switch (c) {
       case 'b':
         bucket = optarg;
@@ -220,11 +226,17 @@ int main(int argc, char **argv) {
       case 'c':
         config = optarg;
         break;
+      case 'd':
+        array_push(fuse_options, &debug);
+        break;
       case 'e':
         exclusive = 1;
         break;
       case 'm':
         mount_point = optarg;
+        break;
+      case 's':
+        array_push(fuse_options, &single_threaded);
         break;
       default:
         print_usage(0);
@@ -237,6 +249,8 @@ int main(int argc, char **argv) {
     write_log(LEVEL_ERROR, "B2FS: Bucket name too long. Max length is %d.\n", B2FS_SMALL_GENERIC_BUFFER);
     print_usage(0);
   }
+
+  // Initialize cURL.
   curl_global_init(CURL_GLOBAL_DEFAULT);
 
   // Check if we have a cached API key.
@@ -274,8 +288,17 @@ int main(int argc, char **argv) {
   // We are authenticated and have a valid token. Start up FUSE.
   strcpy(b2_info.bucket, bucket);
   b2_info.exclusive = exclusive;
+
+  // Get CLI arguments ready for FUSE.
   argv[1] = mount_point;
-  return fuse_main(2, argv, &mappings, &b2_info);
+  for (int i = 0; i < array_count(fuse_options); i++) {
+    char *option;
+    array_retrieve(fuse_options, i, &option);
+    argv[i + 2] = option;
+  }
+
+  // Start FUSE.
+  return fuse_main(array_count(fuse_options) + 2, argv, &mappings, &b2_info);
 }
 
 // TODO: Implement this function.
@@ -300,8 +323,8 @@ void *b2fs_init(struct fuse_conn_info *info) {
     char *response = NULL;
 
     // Generate and set url for request.
-    sprintf(state->api_url, "%s/%s", "b2api/v1/b2_list_file_names");
-    strcpy(start_filename, "null");
+    sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_names");
+    memset(start_filename, 0, B2FS_SMALL_GENERIC_BUFFER);
     curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
 
@@ -318,7 +341,11 @@ void *b2fs_init(struct fuse_conn_info *info) {
     // Loop until all files have been loaded.
     while (1) {
       // Set POST body.
-      sprintf(body, "bucketId=%s&startFileName=%s&maxFileCount=1000", state->bucket, start_filename);
+      if (strlen(start_filename)) {
+        sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"maxFileCount\":1000}", state->bucket, start_filename);
+      } else {
+        sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":1000}", state->bucket);
+      }
       curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
       // Perform request.
@@ -333,7 +360,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
           jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * B2FS_MED_GENERIC_BUFFER);
 
           // Make sure enough memory is available, and parse response.
-          for (int i = 1; token_count != JSMN_ERROR_NOMEM; i++) {
+          for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
             token_count = jsmn_parse(&parser, response, strlen(response), tokens, B2FS_LARGE_GENERIC_BUFFER * i);
             if (token_count == JSMN_ERROR_NOMEM) {
               void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_MED_GENERIC_BUFFER * (i + 1)));
