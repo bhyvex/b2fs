@@ -1,13 +1,14 @@
-/*----- System Includes -----*/
+/*----- Includes -----*/
 
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-
-/*----- Local Includes -----*/
-
 #include "hash.h"
 #include "../xxhash/xxhash.h"
+
+/*----- Numerical Constants -----*/
+
+#define HASH_START_SIZE 10
 
 /*----- Type Definitions -----*/
 
@@ -21,13 +22,13 @@ typedef struct hash_node {
 typedef struct hash {
   hash_node_t **data;
   void (*destruct) (void *);
-  int count, size, frozen;
+  int count, size, frozen, elem_size;
   pthread_rwlock_t lock;
 } hash_t;
 
 /*----- Internal Function Declarations -----*/
 
-hash_node_t *create_hash_node(char *key, void *data);
+hash_node_t *create_hash_node(char *key, void *data, int elem_size);
 hash_node_t *insert_hash_node(hash_node_t *head, hash_node_t *insert);
 hash_node_t *find_hash_node(hash_node_t *head, char *key);
 hash_node_t *remove_hash_node(hash_node_t *head, char *key, void (*destruct) (void *));
@@ -42,7 +43,7 @@ int setup_hash(hash_t *table, void (*destruct) (void *)) {
 }
 
 // Function handles creation of a hash struct.
-hash_t *create_hash(void (*destruct) (void *)) {
+hash_t *create_hash(int elem_size, void (*destruct) (void *)) {
   hash_t *table = malloc(sizeof(hash_t));
 
   if (table) {
@@ -51,8 +52,9 @@ hash_t *create_hash(void (*destruct) (void *)) {
     if (table->data && !retval) {
       table->destruct = destruct;
       table->count = 0;
-      table->frozen = 0;
       table->size = HASH_START_SIZE;
+      table->frozen = 0;
+      table->elem_size = elem_size;
     } else {
       // Initialization of a member variable failed.
       if (table->data) free(table->data);
@@ -105,7 +107,7 @@ void rehash(hash_t *table) {
 // Insert data into a hash for a specific key.
 int hash_put(hash_t *table, char *key, void *data) {
   // Verify parameters.
-  if (!table || !key || !data) return HASH_INVAL;
+  if (!table || !key || !data) return HASH_INVAL_ERROR;
 
   // Check if table needs a rehash.
   int rehashed = 0;
@@ -126,7 +128,7 @@ int hash_put(hash_t *table, char *key, void *data) {
   // Abort if we're frozen.
   if (table->frozen) {
     pthread_rwlock_unlock(&table->lock);
-    return HASH_FROZEN;
+    return HASH_FROZEN_ERROR;
   }
 
   // Verify that table does not already contain given key.
@@ -150,12 +152,12 @@ int hash_put(hash_t *table, char *key, void *data) {
       if (find_hash_node(table->data[hash], key)) {
         // Contention on duplicate key insert.
         pthread_rwlock_unlock(&table->lock);
-        return HASH_EXISTS;
+        return HASH_EXISTS_ERROR;
       }
     }
 
     // Data is new.
-    hash_node_t *node = create_hash_node(key, data);
+    hash_node_t *node = create_hash_node(key, data, table->elem_size);
 
     // We have exclusive write access to the hash, and are the only thread attempting to insert this
     // key. Do the deed.
@@ -166,15 +168,14 @@ int hash_put(hash_t *table, char *key, void *data) {
   } else {
     // Key already exists in table.
     pthread_rwlock_unlock(&table->lock);
-    return HASH_EXISTS;
+    return HASH_EXISTS_ERROR;
   }
 }
 
 // Function handles getting data out of a hash for a specific key.
-void *hash_get(hash_t *table, char *key) {
+int hash_get(hash_t *table, char *key, void *buf) {
   // Verify parameters.
-  if (!table || !table->count || !key) return NULL;
-
+  if (!table || !table->count || !key || !buf) return HASH_INVAL_ERROR;
 
   // Acquire read-lock.
   pthread_rwlock_rdlock(&table->lock);
@@ -186,16 +187,19 @@ void *hash_get(hash_t *table, char *key) {
   hash_node_t *found = find_hash_node(table->data[hash], key);
 
   // Return the data if it was found.
-  void *data = NULL;
-  if (found) data = found->data;
-  pthread_rwlock_unlock(&table->lock);
-  return data;
+  if (found) {
+    memcpy(buf, found->data, table->elem_size);
+    pthread_rwlock_unlock(&table->lock);
+    return HASH_SUCCESS;
+  } else {
+    return HASH_NOTFOUND_ERROR;
+  }
 }
 
 // Handle removal of a key from hash.
 int hash_drop(hash_t *table, char *key) {
   // Verify parameters.
-  if (!table || table->count == 0 || !key) return HASH_INVAL;
+  if (!table || table->count == 0 || !key) return HASH_INVAL_ERROR;
 
   // Acquire read lock for searching.
   pthread_rwlock_rdlock(&table->lock);
@@ -206,7 +210,7 @@ int hash_drop(hash_t *table, char *key) {
   // Abort if we're frozen.
   if (table->frozen) {
     pthread_rwlock_unlock(&table->lock);
-    return HASH_FROZEN;
+    return HASH_FROZEN_ERROR;
   }
 
   if (find_hash_node(table->data[hash], key)) {
@@ -220,7 +224,7 @@ int hash_drop(hash_t *table, char *key) {
     if (!find_hash_node(table->data[hash], key)) {
       // Contention on key removal.
       pthread_rwlock_unlock(&table->lock);
-      return HASH_NOTFOUND;
+      return HASH_NOTFOUND_ERROR;
     }
 
     // We have exclusive write access to the hash, and have verified that we're
@@ -232,7 +236,7 @@ int hash_drop(hash_t *table, char *key) {
   } else {
     // Key does not exist in table.
     pthread_rwlock_unlock(&table->lock);
-    return HASH_NOTFOUND;
+    return HASH_NOTFOUND_ERROR;
   }
 }
 
@@ -293,19 +297,21 @@ void destroy_hash(hash_t *table) {
 /*---- Hash Node Functions ----*/
 
 // Function handles the creation of a hash_node struct.
-hash_node_t *create_hash_node(char *key, void *data) {
+hash_node_t *create_hash_node(char *key, void *data, int elem_size) {
   hash_node_t *node = malloc(sizeof(hash_node_t));
 
   if (node) {
     // Copy given string so it can't be freed out from under us.
-    char *intern_key = malloc(sizeof(char) * (strlen(key) + 1));
-    if (intern_key) {
-      strcpy(intern_key, key);
-      node->key = intern_key;
-      node->data = data;
+    node->key = malloc(sizeof(char) * (strlen(key) + 1));
+    node->data = malloc(elem_size);
+    if (node->key && node->data) {
+      strcpy(node->key, key);
+      memcpy(node->data, data, elem_size);
       node->next = NULL;
     } else {
       // Key could not be copied. Continued initialization impossible.
+      if (node->key) free(node->key);
+      if (node->data) free(node->data);
       free(node);
       node = NULL;
     }
@@ -394,5 +400,6 @@ void destroy_hash_chain(hash_node_t *head, void (*destruct) (void *)) {
 void destroy_hash_node(hash_node_t *node, void (*destruct) (void *)) {
   free(node->key);
   destruct(node->data);
+  free(node->data);
   free(node);
 }

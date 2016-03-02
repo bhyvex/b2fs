@@ -3,13 +3,12 @@
 
 /*----- Numerical Constants -----*/
 
-#define HASH_START_SIZE 10
 #define HASH_SUCCESS 0x00
-#define HASH_FROZEN -0x01
-#define HASH_NOMEM -0x02
-#define HASH_INVAL -0x04
-#define HASH_EXISTS -0x08
-#define HASH_NOTFOUND -0x10
+#define HASH_FROZEN_ERROR -0x01
+#define HASH_NOMEM_ERROR -0x02
+#define HASH_INVAL_ERROR -0x04
+#define HASH_EXISTS_ERROR -0x08
+#define HASH_NOTFOUND_ERROR -0x10
 
 /*----- Type Declarations -----*/
 
@@ -17,10 +16,10 @@ typedef struct hash hash_t;
 
 /*----- Hash Functions -----*/
 
-hash_t *create_hash(void (*destruct) (void *));
+hash_t *create_hash(int elem_size, void (*destruct) (void *));
 int init_hash(hash_t *table, void (*destruct) (void *));
 int hash_put(hash_t *table, char *key, void *data);
-void *hash_get(hash_t *table, char *key);
+int hash_get(hash_t *table, char *key, void *buf);
 int hash_drop(hash_t *table, char *key);
 char **hash_keys(hash_t *table);
 void hash_freeze(hash_t *table);

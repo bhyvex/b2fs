@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
   }
 
   // Make necessary allocations.
-  hash_t *hash = create_hash(destroy_and_decrement);
+  hash_t *hash = create_hash(sizeof(char *), destroy_and_decrement);
   char ***thread_keys = malloc(sizeof(char **) * num_threads);
   voidargs_t *args = malloc(sizeof(voidargs_t) * num_threads);
   pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
@@ -74,9 +74,11 @@ int main(int argc, char **argv) {
 
     char **keys = thread_keys[i];
     for (int j = 0; j < num_insertions; j++) {
-      char *key = keys[j], *value = hash_get(hash, key);
+      char *key = keys[j], *value;
+      assert(hash_get(hash, key, &value) == HASH_SUCCESS);
       assert(!strcmp(key, value));
       assert(hash_drop(hash, key) == HASH_SUCCESS);
+      free(key);
     }
   }
 
@@ -111,7 +113,7 @@ void *perform_insertions(void *voidargs) {
       output[i][strlen] = '\0';
 
       // Insert it into the hash.
-      if (hash_put(hash, output[i], output[i]) == HASH_SUCCESS) break;
+      if (hash_put(hash, output[i], &output[i]) == HASH_SUCCESS) break;
     }
 
     // Increment the insertion counter.
@@ -122,6 +124,6 @@ void *perform_insertions(void *voidargs) {
 }
 
 void destroy_and_decrement(void *voidarg) {
-  free(voidarg);
+  (void) voidarg;
   __sync_fetch_and_sub(&insertion_count, 1);
 }

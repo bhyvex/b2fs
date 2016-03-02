@@ -101,7 +101,7 @@ typedef struct b2fs_file_chunk {
 typedef struct b2fs_file_entry {
   bitmap_t *chunkmap;
   keytree_t *chunks;
-  int readers, writers, size, dynamic;
+  int readers, writers, size;
 } b2fs_file_entry_t;
 
 typedef struct b2fs_hash_entry {
@@ -283,7 +283,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   // Initialize the filesystem cache.
-  state->fs_cache = create_hash(destroy_hash_entry);
+  state->fs_cache = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
   if (!state->fs_cache) {
     write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
     fuse_exit(fuse_get_context()->fuse);
@@ -582,7 +582,7 @@ void destroy_file_entry(void *voidarg) {
   b2fs_file_entry_t *entry = voidarg;
   keytree_destroy(entry->chunks);
   destroy_bitmap(entry->chunkmap);
-  if (entry->dynamic) free(entry);
+  free(entry);
 }
 
 void destroy_hash_entry(void *voidarg) {
@@ -627,23 +627,24 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
   
   // Iterate across path pieces and create all intermediate directories.
   for (char *piece = path_pieces[i++]; path_pieces[i + 1]; piece = path_pieces[i++]) {
-    b2fs_hash_entry_t *entry = hash_get(current, piece);
+    b2fs_hash_entry_t entry;
+    int retval = hash_get(current, piece, &entry);
 
-    if (!entry) {
+    if (retval != HASH_SUCCESS) {
       // Create a new hash entry of type directory.
       b2fs_hash_entry_t new_entry;
       new_entry.type = TYPE_DIRECTORY;
-      new_entry.directory = create_hash(destroy_hash_entry);
+      new_entry.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
 
       // Put it in the previous directory.
       hash_put(current, piece, &new_entry);
-      entry = hash_get(current, piece);
-    } else if (entry->type != TYPE_DIRECTORY) {
+      hash_get(current, piece, &entry);
+    } else if (entry.type != TYPE_DIRECTORY) {
       // An intermediate piece was not a directory. Give up and return.
       return NULL;
     }
 
-    current = entry->directory;
+    current = entry.directory;
   }
 
   // Move final piece up to front of array for ease of access.
