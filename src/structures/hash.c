@@ -187,6 +187,7 @@ int hash_get(hash_t *table, char *key, void *buf) {
     pthread_rwlock_unlock(&table->lock);
     return HASH_SUCCESS;
   } else {
+    pthread_rwlock_unlock(&table->lock);
     return HASH_NOTFOUND_ERROR;
   }
 }

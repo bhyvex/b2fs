@@ -7,7 +7,6 @@
 #include <time.h>
 #include "keytree.h"
 #include "stack.h"
-#include "list.h"
 
 /*----- Macro Definitions -----*/
 
@@ -594,16 +593,4 @@ void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*v
   if (key_destroy) key_destroy(node->key);
   if (val_destroy) val_destroy(node->value);
   free(node);
-}
-
-void print_tree(keytree_t *tree) {
-  list_t *lst = create_list(sizeof(tree_node_t *), free);
-  lpush(lst, &tree->root);
-
-  tree_node_t *current;
-  while (rpop(lst, &current) != LIST_EMPTY) {
-    printf(" (%s) ", current->key);
-    if (current->left) lpush(lst, &current->left);
-    if (current->right) lpush(lst, &current->right);
-  }
 }

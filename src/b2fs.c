@@ -89,9 +89,15 @@ typedef enum b2fs_entry_type {
   TYPE_FILE
 } b2fs_entry_type_t;
 
+typedef struct b2fs_string {
+  char *str;
+  int len, ptr;
+} b2fs_string_t;
+
 typedef struct b2_account {
   char account_id[B2FS_ACCOUNT_ID_LEN];
   char app_key[B2FS_APP_KEY_LEN];
+  char bucket_id[B2FS_SMALL_GENERIC_BUFFER];
 } b2_account_t;
 
 typedef struct b2fs_file_chunk {
@@ -220,7 +226,11 @@ int main(int argc, char **argv) {
   // Get CLI options.
   while ((c = getopt_long(argc, argv, "b:c:dem:s", long_options, &index)) != -1) {
     switch (c) {
-      case 'b':
+      case 'b': 
+        if (strlen(optarg) > B2FS_SMALL_GENERIC_BUFFER - 1) {
+          write_log(LEVEL_ERROR, "B2FS: Bucket name too long. Max length is %d.\n", B2FS_SMALL_GENERIC_BUFFER);
+          print_usage(0);
+        }
         bucket = optarg;
         break;
       case 'c':
@@ -242,13 +252,6 @@ int main(int argc, char **argv) {
         print_usage(0);
     }
   }
-  if (!mount_point || !bucket) {
-    write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mountpoint and bucket.\n");
-    print_usage(0);
-  } else if (strlen(bucket) > B2FS_SMALL_GENERIC_BUFFER - 1) {
-    write_log(LEVEL_ERROR, "B2FS: Bucket name too long. Max length is %d.\n", B2FS_SMALL_GENERIC_BUFFER);
-    print_usage(0);
-  }
 
   // Initialize cURL.
   curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -257,27 +260,38 @@ int main(int argc, char **argv) {
   retval = find_cached_auth(&b2_info);
 
   // Get account information from the config file if not cached.
-  if (retval && parse_config(&account, config)) {
+  memset(&account, 0, sizeof(b2_account_t));
+  if (parse_config(&account, config)) {
     write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
+    exit(EXIT_FAILURE);
+  } else if (!mount_point || (!strlen(account.bucket_id) && !bucket)) {
+    write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mount point and a bucket id.\n");
+    print_usage(0);
   }
+  if (!bucket) bucket = account.bucket_id;
 
   if (retval) {
     // Attempt to grab authentication token from B2.
     retval = attempt_authentication(&account, &b2_info);
 
     // Check response.
-    if (retval == B2FS_NETWORK_ACCESS_ERROR) {
-      write_log(LEVEL_ERROR, "B2FS: Authentication failed. Credentials are invalid.\n");
-    } else if (retval == B2FS_NETWORK_API_ERROR) {
-      write_log(LEVEL_ERROR, "B2FS: BackBlaze API has changed. B2FS will not work without an update.\n");
-    } else if (retval == B2FS_NETWORK_INTERN_ERROR) {
-      write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", b2_info.token);
-      write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
-    } else if (retval == B2FS_GENERIC_NETWORK_ERROR) {
-      write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", b2_info.token);
-      write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n");
-    } else if (retval == B2FS_GENERIC_ERROR) {
-      write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
+    switch (retval) {
+      case B2FS_NETWORK_ACCESS_ERROR:
+        write_log(LEVEL_ERROR, "B2FS: Authentication failed. Credentials are invalid.\n");
+        break;
+      case B2FS_NETWORK_API_ERROR:
+        write_log(LEVEL_ERROR, "B2FS: BackBlaze API has changed. B2FS will not work without an update.\n");
+        break;
+      case B2FS_NETWORK_INTERN_ERROR:
+        write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", b2_info.token);
+        write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
+        break;
+      case B2FS_GENERIC_NETWORK_ERROR:
+        write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", b2_info.token);
+        write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n");
+        break;
+      case B2FS_GENERIC_ERROR:
+        write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
     }
     if (retval != B2FS_SUCCESS) return EXIT_FAILURE;
 
@@ -320,7 +334,8 @@ void *b2fs_init(struct fuse_conn_info *info) {
     CURL *curl = curl_easy_init();
     char urlbuf[B2FS_SMALL_GENERIC_BUFFER], start_filename[B2FS_SMALL_GENERIC_BUFFER];
     char auth[B2FS_SMALL_GENERIC_BUFFER], body[B2FS_SMALL_GENERIC_BUFFER];
-    char *response = NULL;
+    b2fs_string_t response;
+    memset(&response, 0, sizeof(b2fs_string_t));
 
     // Generate and set url for request.
     sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_names");
@@ -339,12 +354,12 @@ void *b2fs_init(struct fuse_conn_info *info) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
     // Loop until all files have been loaded.
-    while (1) {
+    while (strcmp(start_filename, "null")) {
       // Set POST body.
       if (strlen(start_filename)) {
-        sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"maxFileCount\":1000}", state->bucket, start_filename);
+        sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"maxFileCount\":100}", state->bucket, start_filename);
       } else {
-        sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":1000}", state->bucket);
+        sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":100}", state->bucket);
       }
       curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
@@ -361,7 +376,8 @@ void *b2fs_init(struct fuse_conn_info *info) {
 
           // Make sure enough memory is available, and parse response.
           for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
-            token_count = jsmn_parse(&parser, response, strlen(response), tokens, B2FS_LARGE_GENERIC_BUFFER * i);
+            memset(&parser, 0, sizeof(jsmn_parser));
+            token_count = jsmn_parse(&parser, response.str, strlen(response.str), tokens, B2FS_MED_GENERIC_BUFFER * i);
             if (token_count == JSMN_ERROR_NOMEM) {
               void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_MED_GENERIC_BUFFER * (i + 1)));
               if (!tmp) {
@@ -383,28 +399,27 @@ void *b2fs_init(struct fuse_conn_info *info) {
           // Zero start_filename to ensure null termination.
           memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
           for (int i = 1; i < token_count; i++) {
-            jsmntok_t *key = &tokens[i++], *value = &tokens[i];
-            int len = value->end - value->start;
+            jsmntok_t *key = &tokens[i++], *value = &tokens[i++];
+            int len = value->end - value->start, token_index = i;
 
-            if (jsmn_iskey(response, key, "files")) {
-              for (int j = i + 1; j < i + value->size; j++) {
-                jsmntok_t *file = &tokens[j];
+            if (jsmn_iskey(response.str, key, "files")) {
+              for (int j = 0; j < value->size; j++) {
+                jsmntok_t *file = &tokens[token_index++];
                 b2fs_hash_entry_t entry;
-                char **path_pieces;
+                char **path_pieces, filename[B2FS_SMALL_GENERIC_BUFFER];
                 long size;
 
                 // Parse out file path pieces and file size.
-                for (int k = j + 1; k < j + file->size; k++) {
-                  jsmntok_t *obj_key = &tokens[k++], *obj_value = &tokens[k];
+                for (int k = 0; k < file->size; k++) {
+                  jsmntok_t *obj_key = &tokens[token_index++], *obj_value = &tokens[token_index++];
                   int obj_len = obj_value->end - obj_value->start;
 
-                  if (jsmn_iskey(response, obj_key, "fileName")) {
-                    char filename[B2FS_SMALL_GENERIC_BUFFER];
+                  if (jsmn_iskey(response.str, obj_key, "fileName")) {
                     memset(filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-                    memcpy(filename, response + obj_value->start, obj_len);
+                    memcpy(filename, response.str + obj_value->start, obj_len);
                     path_pieces = split_path(filename);
-                  } else if (jsmn_iskey(response, obj_key, "size")) {
-                    size = strtol(response + obj_value->start, NULL, 10);
+                  } else if (jsmn_iskey(response.str, obj_key, "size")) {
+                    size = strtol(response.str + obj_value->start, NULL, 10);
                   }
                 }
 
@@ -421,21 +436,37 @@ void *b2fs_init(struct fuse_conn_info *info) {
 
                 // Clean up and prepare for next iteration.
                 free(path_pieces);
-                j += file->size;
               }
-            } else if (jsmn_iskey(response, key, "nextFileName")) {
-              memcpy(start_filename, response + value->start, len);
+
+              // Back up the token index for the outer loop.
+              token_index--;
+            } else if (jsmn_iskey(response.str, key, "nextFileName")) {
+              memcpy(start_filename, response.str + value->start, len);
             } else {
               // We received an unknown key from B2. Log it, but try to keep going.
-              LOG_KEY(response, key, "b2fs_init");
+              LOG_KEY(response.str, key, "b2fs_init");
             }
 
             // Prepare for next iteration.
-            i += value->size;
+            i = token_index;
           }
+
+          // Clear the response string to prepare for the next iteration.
+          free(response.str);
+          response.str = NULL;
+          response.ptr = 0;
+        } else {
+          // TODO: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to add
+          // logic here to attempt a re-authentication.
+          write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %d with message: %s\n", code, response);
+          write_log(LEVEL_ERROR, "B2FS: B2 returned an error during startup. This is most likely a bug. Go make a report.\n");
+          hash_destroy(state->fs_cache);
+          fuse_exit(fuse_get_context()->fuse);
         }
       }
     }
+
+    puts("Entire filesystem cached!");
   }
 
   return NULL;
@@ -576,17 +607,21 @@ int b2fs_access(const char *path, int mode) {
 }
 
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
-  char *recvbuf = malloc(sizeof(char) * ((size * nmembers) + 1));
+  b2fs_string_t *output = voidarg;
 
-  if (recvbuf) {
-    char **output = voidarg;
-    memcpy(recvbuf, data, size * nmembers);
-    *(recvbuf + (size * nmembers)) = '\0';
-    *output = recvbuf;
-    return size * nmembers;
-  } else {
-    return 0;
+  // Check for resize.
+  if (output->len < (size * nmembers) + output->ptr + 1) {
+    int power = 1;
+    while (power <= (size * nmembers) + output->ptr + 1) power <<= 1;
+    void *tmp = realloc(output->str, power);
+    if (!tmp) return 0;
+    output->str = tmp;
   }
+
+  memcpy(output->str + output->ptr, data, size * nmembers);
+  output->str[output->ptr + (size * nmembers)] = '\0';
+  output->ptr += size *nmembers;
+  return size * nmembers;
 }
 
 
@@ -628,11 +663,11 @@ int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
 }
 
 char **split_path(char *path) {
-  char **parts = malloc(sizeof(char *) * B2FS_SMALL_GENERIC_BUFFER), **strtok_ptr = NULL;
+  char **parts = malloc(sizeof(char *) * B2FS_SMALL_GENERIC_BUFFER), *strtok_ptr;
   int size = B2FS_SMALL_GENERIC_BUFFER, counter = 0;
 
   // Iterate across string, reallocating as we go, and store token pointers.
-  for (char *current = strtok_r(path, "/", strtok_ptr); current; current = strtok_r(NULL, "/", strtok_ptr)) {
+  for (char *current = strtok_r(path, "/", &strtok_ptr); current; current = strtok_r(NULL, "/", &strtok_ptr)) {
     if (counter == size - 1) {
       void *tmp = realloc(parts, size *= 2);
       if (!tmp) {
@@ -653,7 +688,7 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
   int i = 0;
   
   // Iterate across path pieces and create all intermediate directories.
-  for (char *piece = path_pieces[i++]; path_pieces[i + 1]; piece = path_pieces[i++]) {
+  for (char *piece = path_pieces[i++]; path_pieces[i]; piece = path_pieces[i++]) {
     b2fs_hash_entry_t entry;
     int retval = hash_get(current, piece, &entry);
 
@@ -675,7 +710,7 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
   }
 
   // Move final piece up to front of array for ease of access.
-  path_pieces[0] = path_pieces[i];
+  path_pieces[0] = path_pieces[i - 1];
 
   // Return the directory containing the file.
   return current;
@@ -728,13 +763,16 @@ int parse_config(b2_account_t *auth, char *config_file) {
   memset(auth, 0, sizeof(b2_account_t));
 
   if (config) {
-    for (int i = 0; i < 2; i++) {
-      fscanf(config, "%s %s\n", keybuf, valbuf);
+    for (int i = 0; i < 3; i++) {
+      int retval = fscanf(config, "%s %s\n", keybuf, valbuf);
+      if (retval != 2) break;
 
       if (!strcmp(keybuf, "account_id:")) {
         strcpy(auth->account_id, valbuf);
       } else if (!strcmp(keybuf, "app_key:")) {
         strcpy(auth->app_key, valbuf);
+      } else if (!strcmp(keybuf, "bucket:")) {
+        strcpy(auth->bucket_id, valbuf);
       } else {
         write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
       }
@@ -753,7 +791,9 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
   if (curl) {
     char *url = "https://api.backblaze.com/b2api/v1/b2_authorize_account";
     char conversionbuf[B2FS_SMALL_GENERIC_BUFFER], based[B2FS_SMALL_GENERIC_BUFFER], final[B2FS_SMALL_GENERIC_BUFFER];
-    char *tmp = based, *data = NULL;
+    char *tmp = based;
+    b2fs_string_t data;
+    memset(&data, 0, sizeof(b2fs_string_t));
 
     // Set URL for request.
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -790,9 +830,9 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
 
         // Our authentication request went through. Time to JSON parse.
         jsmn_init(&parser);
-        token_count = jsmn_parse(&parser, data, strlen(data), tokens, B2FS_SMALL_GENERIC_BUFFER);
+        token_count = jsmn_parse(&parser, data.str, strlen(data.str), tokens, B2FS_SMALL_GENERIC_BUFFER);
         if (token_count == JSMN_ERROR_NOMEM || tokens[0].type != JSMN_OBJECT) {
-          free(data);
+          free(data.str);
           return B2FS_NETWORK_API_ERROR;
         }
 
@@ -802,17 +842,17 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
           jsmntok_t *key = &tokens[i++], *value = &tokens[i];
           int len = value->end - value->start;
 
-          if (jsmn_iskey(data, key, "authorizationToken")) {
-            memcpy(b2_info->token, data + value->start, len);
-          } else if (jsmn_iskey(data, key, "apiUrl")) {
-            memcpy(b2_info->api_url, data + value->start, len);
-          } else if (jsmn_iskey(data, key, "downloadUrl")) {
-            memcpy(b2_info->down_url, data + value->start, len);
-          } else if (!jsmn_iskey(data, key, "accountId")) {
-            LOG_KEY(data, key, "authentication");
+          if (jsmn_iskey(data.str, key, "authorizationToken")) {
+            memcpy(b2_info->token, data.str + value->start, len);
+          } else if (jsmn_iskey(data.str, key, "apiUrl")) {
+            memcpy(b2_info->api_url, data.str + value->start, len);
+          } else if (jsmn_iskey(data.str, key, "downloadUrl")) {
+            memcpy(b2_info->down_url, data.str + value->start, len);
+          } else if (!jsmn_iskey(data.str, key, "accountId")) {
+            LOG_KEY(data.str, key, "authentication");
           }
         }
-        free(data);
+        free(data.str);
 
         // Validate and return!
         if (strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url)) {
@@ -822,13 +862,13 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
         }
       } else if (code == 401) {
         // Our authentication request was rejected due to bad auth info.
-        free(data);
+        free(data.str);
         return B2FS_NETWORK_ACCESS_ERROR;
       } else {
         // Request was badly formatted. Denotes an internal error.
-        strncpy(b2_info->token, data, B2FS_TOKEN_LEN - 1);
+        strncpy(b2_info->token, data.str, B2FS_TOKEN_LEN - 1);
         b2_info->token[B2FS_TOKEN_LEN - 1] = '\0';
-        free(data);
+        free(data.str);
         return B2FS_NETWORK_INTERN_ERROR;
       }
       return B2FS_SUCCESS;
