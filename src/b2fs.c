@@ -17,10 +17,13 @@
 #define B2FS_SMALL_GENERIC_BUFFER 256
 #define B2FS_MED_GENERIC_BUFFER 1024
 #define B2FS_LARGE_GENERIC_BUFFER 4096
-#define B2FS_CHUNK_SIZE (1024 * 1024 * 16)
+#define B2FS_CHUNK_SIZE (1024 * 1024 * 4)
 #define B2FS_INIT_CHUNK_NUM 10
 
 #define FUSE_USE_VERSION 30
+
+#define ROOT_UID 0
+#define ROOT_GID 0
 
 /*----- System Includes -----*/
 
@@ -91,7 +94,7 @@ typedef enum b2fs_entry_type {
 
 typedef struct b2fs_string {
   char *str;
-  int len, ptr;
+  unsigned int len, ptr;
 } b2fs_string_t;
 
 typedef struct b2_account {
@@ -108,7 +111,8 @@ typedef struct b2fs_file_chunk {
 typedef struct b2fs_file_entry {
   bitmap_t *chunkmap;
   keytree_t *chunks;
-  int readers, writers, size;
+  char id[B2FS_SMALL_GENERIC_BUFFER];
+  int readers, writers, size, timestamp, version;
 } b2fs_file_entry_t;
 
 typedef struct b2fs_hash_entry {
@@ -123,7 +127,6 @@ typedef struct b2fs_state {
   char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];
   char down_url[B2FS_TOKEN_LEN], bucket[B2FS_SMALL_GENERIC_BUFFER];
   hash_t *fs_cache;
-  int exclusive;
 } b2fs_state_t;
 
 /*----- Local Function Declarations -----*/
@@ -158,20 +161,23 @@ int b2fs_access(const char *path, int mode);
 
 // Network Functions.
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
+int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info);
 
 // Struct Initializers.
 int init_file_entry(b2fs_file_entry_t *entry, int size);
 void destroy_file_entry(void *voidarg);
 void destroy_hash_entry(void *voidarg);
 
-// Helper Functions.
-int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
+// Filesystem Helpers.
 char **split_path(char *path);
 hash_t *make_path(char **path_pieces, hash_t *base);
+b2fs_hash_entry_t *find_path(char *path, hash_t *base);
+
+// Generic Helper Functions.
+int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
 void cache_auth(b2fs_state_t *b2_info);
 int find_cached_auth(b2fs_state_t *b2_info);
 int parse_config(b2_account_t *auth, char *config_file);
-int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info);
 void find_tmpdir(char **out);
 int intcmp(void *int_one, void *int_two);
 void print_usage(int intentional);
@@ -179,7 +185,7 @@ void print_usage(int intentional);
 /*----- Local Function Implementations -----*/
 
 int main(int argc, char **argv) {
-  int c, index, retval, exclusive = 0;
+  int c, index, retval;
   b2_account_t account;
   b2fs_state_t b2_info;
   char *config = "b2fs.yml", *mount_point = NULL, *bucket = NULL;
@@ -188,7 +194,6 @@ int main(int argc, char **argv) {
     {"bucket", required_argument, 0, 'b'},
     {"config", required_argument, 0, 'c'},
     {"debug", no_argument, 0, 'd'},
-    {"exclusive", no_argument, 0, 'e'},
     {"mount", required_argument, 0, 'm'},
     {"single-threaded", no_argument, 0, 's'},
     {0, 0, 0, 0}
@@ -238,9 +243,6 @@ int main(int argc, char **argv) {
         break;
       case 'd':
         array_push(fuse_options, &debug);
-        break;
-      case 'e':
-        exclusive = 1;
         break;
       case 'm':
         mount_point = optarg;
@@ -301,7 +303,6 @@ int main(int argc, char **argv) {
 
   // We are authenticated and have a valid token. Start up FUSE.
   strcpy(b2_info.bucket, bucket);
-  b2_info.exclusive = exclusive;
 
   // Get CLI arguments ready for FUSE.
   argv[1] = mount_point;
@@ -315,173 +316,240 @@ int main(int argc, char **argv) {
   return fuse_main(array_count(fuse_options) + 2, argv, &mappings, &b2_info);
 }
 
-// TODO: Implement this function.
 void *b2fs_init(struct fuse_conn_info *info) {
+  (void) info;
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   // Initialize the filesystem cache.
   state->fs_cache = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
   if (!state->fs_cache) {
     write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
+    hash_destroy(state->fs_cache);
     fuse_exit(fuse_get_context()->fuse);
   }
 
-  if (state->exclusive) {
-    // The user has specified that we have exclusive access to the bucket.
-    // Go ahead and cache all filenames ahead of time to decrease latency on later
-    // calls.
-    CURLcode res;
-    CURL *curl = curl_easy_init();
-    char urlbuf[B2FS_SMALL_GENERIC_BUFFER], start_filename[B2FS_SMALL_GENERIC_BUFFER];
-    char auth[B2FS_SMALL_GENERIC_BUFFER], body[B2FS_SMALL_GENERIC_BUFFER];
-    b2fs_string_t response;
-    memset(&response, 0, sizeof(b2fs_string_t));
+  // B2FS currently expects to have exclusive access to the bucket.
+  // Go ahead and cache all filenames ahead of time to decrease latency on later
+  // calls.
+  CURLcode res;
+  CURL *curl = curl_easy_init();
+  char urlbuf[B2FS_SMALL_GENERIC_BUFFER], start_filename[B2FS_SMALL_GENERIC_BUFFER];
+  char auth[B2FS_SMALL_GENERIC_BUFFER], body[B2FS_SMALL_GENERIC_BUFFER];
+  b2fs_string_t response;
+  memset(&response, 0, sizeof(b2fs_string_t));
 
-    // Generate and set url for request.
-    sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_names");
-    memset(start_filename, 0, B2FS_SMALL_GENERIC_BUFFER);
-    curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  // Generate and set url for request.
+  sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_names");
+  memset(start_filename, 0, B2FS_SMALL_GENERIC_BUFFER);
+  curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
 
-    // Set authorization header for request.
-    sprintf(auth, "Authorization: %s", state->token);
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, auth);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  // Set authorization header for request.
+  sprintf(auth, "Authorization: %s", state->token);
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, auth);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    // Setup data callbacks.
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_string);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+  // Setup data callbacks.
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_string);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    // Loop until all files have been loaded.
-    while (strcmp(start_filename, "null")) {
-      // Set POST body.
-      if (strlen(start_filename)) {
-        sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"maxFileCount\":100}", state->bucket, start_filename);
-      } else {
-        sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":100}", state->bucket);
-      }
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+  // Loop until all files have been loaded.
+  while (strcmp(start_filename, "null")) {
+    // Set POST body.
+    if (strlen(start_filename)) {
+      sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"maxFileCount\":1000}", state->bucket, start_filename);
+    } else {
+      sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":100}", state->bucket);
+    }
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
-      // Perform request.
-      if ((res = curl_easy_perform(curl)) == CURLE_OK) {
-        long code;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    // Perform request.
+    if ((res = curl_easy_perform(curl)) == CURLE_OK) {
+      long code;
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 
-        if (code == 200) {
-          // Our request was accepted! Get ready to parse json response.
-          int token_count = JSMN_ERROR_NOMEM;
-          jsmn_parser parser;
-          jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * B2FS_MED_GENERIC_BUFFER);
+      if (code == 200) {
+        // Our request was accepted! Get ready to parse json response.
+        int token_count = JSMN_ERROR_NOMEM;
+        jsmn_parser parser;
+        jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * B2FS_MED_GENERIC_BUFFER);
 
-          // Make sure enough memory is available, and parse response.
-          for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
-            memset(&parser, 0, sizeof(jsmn_parser));
-            token_count = jsmn_parse(&parser, response.str, strlen(response.str), tokens, B2FS_MED_GENERIC_BUFFER * i);
-            if (token_count == JSMN_ERROR_NOMEM) {
-              void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_MED_GENERIC_BUFFER * (i + 1)));
-              if (!tmp) {
-                write_log(LEVEL_DEBUG, "B2FS: Failed to allocate enough tokens for initial fs caching...\n");
-                write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
-                if (tokens) free(tokens);
-                hash_destroy(state->fs_cache);
-                fuse_exit(fuse_get_context()->fuse);
-              }
-              tokens = tmp;
-            } else if (token_count == JSMN_ERROR_INVAL || token_count == JSMN_ERROR_PART) {
-              write_log(LEVEL_ERROR, "B2FS: B2 returned an invalid response during startup.\n");
+        // Make sure enough memory is available, and parse response.
+        for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
+          memset(&parser, 0, sizeof(jsmn_parser));
+          token_count = jsmn_parse(&parser, response.str, strlen(response.str), tokens, B2FS_MED_GENERIC_BUFFER * i);
+          if (token_count == JSMN_ERROR_NOMEM) {
+            void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_MED_GENERIC_BUFFER * (i + 1)));
+            if (!tmp) {
+              write_log(LEVEL_DEBUG, "B2FS: Failed to allocate enough tokens for initial fs caching...\n");
+              write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
               if (tokens) free(tokens);
               hash_destroy(state->fs_cache);
+              curl_slist_free_all(headers);
+              curl_easy_cleanup(curl);
               fuse_exit(fuse_get_context()->fuse);
             }
+            tokens = tmp;
+          } else if (token_count == JSMN_ERROR_INVAL || token_count == JSMN_ERROR_PART) {
+            write_log(LEVEL_ERROR, "B2FS: B2 returned an invalid response during startup.\n");
+            if (tokens) free(tokens);
+            hash_destroy(state->fs_cache);
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            fuse_exit(fuse_get_context()->fuse);
           }
+        }
 
-          // Zero start_filename to ensure null termination.
-          memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-          for (int i = 1; i < token_count; i++) {
-            jsmntok_t *key = &tokens[i++], *value = &tokens[i++];
-            int len = value->end - value->start, token_index = i;
+        // Zero start_filename to ensure null termination.
+        memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+        for (int i = 1; i < token_count; i++) {
+          jsmntok_t *key = &tokens[i++], *value = &tokens[i++];
+          int len = value->end - value->start, token_index = i;
 
-            if (jsmn_iskey(response.str, key, "files")) {
-              for (int j = 0; j < value->size; j++) {
-                jsmntok_t *file = &tokens[token_index++];
-                b2fs_hash_entry_t entry;
-                char **path_pieces, filename[B2FS_SMALL_GENERIC_BUFFER];
-                long size;
+          if (jsmn_iskey(response.str, key, "files")) {
+            for (int j = 0; j < value->size; j++) {
+              jsmntok_t *file = &tokens[token_index++];
+              b2fs_hash_entry_t entry;
+              char **path_pieces, filename[B2FS_SMALL_GENERIC_BUFFER], file_id[B2FS_SMALL_GENERIC_BUFFER];
+              long size, timestamp;
 
-                // Parse out file path pieces and file size.
-                for (int k = 0; k < file->size; k++) {
-                  jsmntok_t *obj_key = &tokens[token_index++], *obj_value = &tokens[token_index++];
-                  int obj_len = obj_value->end - obj_value->start;
+              // Parse out file path pieces and file size.
+              for (int k = 0; k < file->size; k++) {
+                jsmntok_t *obj_key = &tokens[token_index++], *obj_value = &tokens[token_index++];
+                int obj_len = obj_value->end - obj_value->start;
 
-                  if (jsmn_iskey(response.str, obj_key, "fileName")) {
-                    memset(filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-                    memcpy(filename, response.str + obj_value->start, obj_len);
-                    path_pieces = split_path(filename);
-                  } else if (jsmn_iskey(response.str, obj_key, "size")) {
-                    size = strtol(response.str + obj_value->start, NULL, 10);
-                  }
+                if (jsmn_iskey(response.str, obj_key, "fileName")) {
+                  memset(filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+                  memcpy(filename, response.str + obj_value->start, obj_len);
+                  path_pieces = split_path(filename);
+                } else if (jsmn_iskey(response.str, obj_key, "size")) {
+                  size = strtol(response.str + obj_value->start, NULL, 10);
+                } else if (jsmn_iskey(response.str, obj_key, "uploadTimestamp")) {
+                  timestamp = strtol(response.str + obj_value->start, NULL, 10);
+                } else if (jsmn_iskey(response.str, obj_key, "fileId")) {
+                  memset(filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+                  memcpy(file_id, response.str + obj_value->start, obj_len);
                 }
-
-                // Make all intermediate directories.
-                hash_t *dir = make_path(path_pieces, state->fs_cache);
-                
-                // Initialize file entry.
-                int num_chunks = ceil(ceil(size / (float) B2FS_CHUNK_SIZE) / (float) 8);
-                entry.type = TYPE_FILE;
-                init_file_entry(&entry.file, num_chunks);
-
-                // Put it in the directory cache.
-                hash_put(dir, path_pieces[0], &entry);
-
-                // Clean up and prepare for next iteration.
-                free(path_pieces);
               }
 
-              // Back up the token index for the outer loop.
-              token_index--;
-            } else if (jsmn_iskey(response.str, key, "nextFileName")) {
-              memcpy(start_filename, response.str + value->start, len);
-            } else {
-              // We received an unknown key from B2. Log it, but try to keep going.
-              LOG_KEY(response.str, key, "b2fs_init");
+              // Make all intermediate directories.
+              hash_t *dir = make_path(path_pieces, state->fs_cache);
+
+              // Initialize file entry.
+              int num_chunks = ceil(ceil(size / (float) B2FS_CHUNK_SIZE) / (float) 8);
+              init_file_entry(&entry.file, num_chunks);
+              entry.type = TYPE_FILE;
+              entry.file.size = size;
+              entry.file.timestamp = timestamp;
+              strcpy(entry.file.id, file_id);
+
+              // Put it in the directory cache.
+              hash_put(dir, path_pieces[0], &entry);
+
+              // Clean up and prepare for next iteration.
+              free(path_pieces);
             }
 
-            // Prepare for next iteration.
-            i = token_index;
+            // Back up the token index for the outer loop.
+            token_index--;
+          } else if (jsmn_iskey(response.str, key, "nextFileName")) {
+            memcpy(start_filename, response.str + value->start, len);
+          } else {
+            // We received an unknown key from B2. Log it, but try to keep going.
+            LOG_KEY(response.str, key, "b2fs_init");
           }
 
-          // Clear the response string to prepare for the next iteration.
-          free(response.str);
-          response.str = NULL;
-          response.ptr = 0;
-        } else {
-          // TODO: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to add
-          // logic here to attempt a re-authentication.
-          write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %d with message: %s\n", code, response);
-          write_log(LEVEL_ERROR, "B2FS: B2 returned an error during startup. This is most likely a bug. Go make a report.\n");
-          hash_destroy(state->fs_cache);
-          fuse_exit(fuse_get_context()->fuse);
+          // Prepare for next iteration.
+          i = token_index;
         }
-      }
-    }
 
-    puts("Entire filesystem cached!");
+        // Clear the response string to prepare for the next iteration.
+        free(response.str);
+        response.str = NULL;
+        response.ptr = 0;
+      } else {
+        // TODO: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to add
+        // logic here to attempt a re-authentication.
+        write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %ld with message: %s\n", code, response.str);
+        write_log(LEVEL_ERROR, "B2FS: B2 returned an error during startup. This is most likely a bug. Go make a report.\n");
+        hash_destroy(state->fs_cache);
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        fuse_exit(fuse_get_context()->fuse);
+      }
+    } else {
+      write_log(LEVEL_DEBUG, "B2FS: cURL failed with error %s during initial caching.\n", curl_easy_strerror(res));
+      hash_destroy(state->fs_cache);
+      curl_slist_free_all(headers);
+      curl_easy_cleanup(curl);
+      fuse_exit(fuse_get_context()->fuse);
+    }
   }
+
+  // Cleanup cURL resources.
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
 
   return NULL;
 }
 
 // TODO: Implement this function.
 void b2fs_destroy(void *userdata) {
-
+  (void) userdata;
 }
 
 // TODO: Implement this function.
 int b2fs_getattr(const char *path, struct stat *statbuf) {
-  return -ENOTSUP;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
+  strcpy(path_copy, path);
+  b2fs_hash_entry_t *entry = find_path(path_copy, state->fs_cache);
+  free(path_copy);
+
+  // Check if entry was found.
+  if (entry) {
+    // Entry exists. Initialize and set values for stat struct.
+    memset(statbuf, 0, sizeof(struct stat));
+
+    // Set file/directory flags.
+    if (entry->type == TYPE_FILE) statbuf->st_mode |= S_IFREG;
+    else statbuf->st_mode |= S_IFDIR;
+
+    // Set read-write-execute permissions for everyone.
+    statbuf->st_mode |= S_IRWXU | S_IRWXG | S_IRWXO;
+
+    // Set owner details.
+    statbuf->st_uid = ROOT_UID;
+    statbuf->st_gid = ROOT_GID;
+
+    // Set other unsupported fields to sane defaults.
+    statbuf->st_nlink = 1;
+    statbuf->st_blksize = 512;
+    statbuf->st_blocks = entry->type == TYPE_FILE ? ceil(entry->file.size / (float) 512) : 1;
+
+    // Set file access dates.
+    // FIXME: I'm assuming these should be UNIX timestamps, but POSIX seems to be a little unsure.
+    // Should probably come up with a better default than 0 for directories. Maybe when I'm feeling
+    // less lazy I could scan across the contents to find the lowest timestamp.
+    if (entry->type == TYPE_FILE) {
+      statbuf->st_atime = entry->file.timestamp;
+      statbuf->st_mtime = entry->file.timestamp;
+      statbuf->st_ctime = entry->file.timestamp;
+    }
+
+    // FIXME: Should directories return size 0?
+    if (entry->type == TYPE_FILE) statbuf->st_size = entry->file.size;
+
+    return B2FS_SUCCESS;
+  } else {
+    // Entry does not exist. Indicate this.
+    return -ENOENT;
+  }
 }
 
+// TODO: Maybe someday support links.
 int b2fs_readlink(const char *path, char *buf, size_t size) {
   (void) path;
   (void) buf;
@@ -611,7 +679,7 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
 
   // Check for resize.
   if (output->len < (size * nmembers) + output->ptr + 1) {
-    int power = 1;
+    unsigned int power = 1;
     while (power <= (size * nmembers) + output->ptr + 1) power <<= 1;
     void *tmp = realloc(output->str, power);
     if (!tmp) return 0;
@@ -622,165 +690,6 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
   output->str[output->ptr + (size * nmembers)] = '\0';
   output->ptr += size *nmembers;
   return size * nmembers;
-}
-
-
-int init_file_entry(b2fs_file_entry_t *entry, int size) {
-  if (!entry) return B2FS_INVAL;
-
-  memset(entry, 0, sizeof(b2fs_file_entry_t));
-  entry->chunkmap = create_bitmap(size ? size : B2FS_INIT_CHUNK_NUM);
-  entry->chunks = create_keytree(free, free, intcmp, sizeof(int), sizeof(b2fs_file_chunk_t));
-  if (!entry->chunkmap || !entry->chunks) {
-    if (entry->chunkmap) free(entry->chunkmap);
-    if (entry->chunks) free(entry->chunks);
-    return B2FS_NOMEM;
-  }
-
-  return B2FS_SUCCESS;
-}
-
-void destroy_file_entry(void *voidarg) {
-  b2fs_file_entry_t *entry = voidarg;
-  keytree_destroy(entry->chunks);
-  destroy_bitmap(entry->chunkmap);
-  free(entry);
-}
-
-void destroy_hash_entry(void *voidarg) {
-  b2fs_hash_entry_t *entry = voidarg;
-  
-  // Identify entry type and destroy.
-  if (entry->type == TYPE_DIRECTORY) hash_destroy(entry->directory);
-  else destroy_file_entry(&entry->file);
-}
-
-int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
-  if (tok->type != JSMN_STRING) return 0;
-  if (((int) strlen(s)) != (tok->end - tok->start)) return 0;
-  if (strncmp(json + tok->start, s, tok->end - tok->start)) return 0;
-  return 1;
-}
-
-char **split_path(char *path) {
-  char **parts = malloc(sizeof(char *) * B2FS_SMALL_GENERIC_BUFFER), *strtok_ptr;
-  int size = B2FS_SMALL_GENERIC_BUFFER, counter = 0;
-
-  // Iterate across string, reallocating as we go, and store token pointers.
-  for (char *current = strtok_r(path, "/", &strtok_ptr); current; current = strtok_r(NULL, "/", &strtok_ptr)) {
-    if (counter == size - 1) {
-      void *tmp = realloc(parts, size *= 2);
-      if (!tmp) {
-        free(parts);
-        return NULL;
-      }
-      parts = tmp;
-    }
-    parts[counter++] = current;
-  }
-  parts[counter++] = NULL;
-
-  return parts;
-}
-
-hash_t *make_path(char **path_pieces, hash_t *base) {
-  hash_t *current = base;
-  int i = 0;
-  
-  // Iterate across path pieces and create all intermediate directories.
-  for (char *piece = path_pieces[i++]; path_pieces[i]; piece = path_pieces[i++]) {
-    b2fs_hash_entry_t entry;
-    int retval = hash_get(current, piece, &entry);
-
-    if (retval != HASH_SUCCESS) {
-      // Create a new hash entry of type directory.
-      b2fs_hash_entry_t new_entry;
-      new_entry.type = TYPE_DIRECTORY;
-      new_entry.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
-
-      // Put it in the previous directory.
-      hash_put(current, piece, &new_entry);
-      hash_get(current, piece, &entry);
-    } else if (entry.type != TYPE_DIRECTORY) {
-      // An intermediate piece was not a directory. Give up and return.
-      return NULL;
-    }
-
-    current = entry.directory;
-  }
-
-  // Move final piece up to front of array for ease of access.
-  path_pieces[0] = path_pieces[i - 1];
-
-  // Return the directory containing the file.
-  return current;
-}
-
-void cache_auth(b2fs_state_t *b2_info) {
-  char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
-
-  // Locate system tmpdir if possible.
-  find_tmpdir(&tmpdir);
-  if (!tmpdir) return;
-
-  // Open cache file.
-  sprintf(path, "%s/b2fs_cache.txt", tmpdir);
-  FILE *cache_out = fopen(path, "w+");
-
-  // Write it out.
-  if (cache_out) {
-    fprintf(cache_out, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
-    fclose(cache_out);
-  }
-}
-
-int find_cached_auth(b2fs_state_t *b2_info) {
-  char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
-  memset(b2_info, 0, sizeof(b2fs_state_t));
-
-  // Locate system tmpdir if possible.
-  find_tmpdir(&tmpdir);
-  if (!tmpdir) return B2FS_GENERIC_ERROR;
-
-  // Open cache file.
-  sprintf(path, "%s/b2fs_cache.txt", tmpdir);
-  FILE *cache_in = fopen(path, "r");
-
-  // Read the cached info in.
-  if (cache_in) {
-    int success;
-    fscanf(cache_in, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
-    success = strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url);
-    return success ? B2FS_SUCCESS : B2FS_GENERIC_ERROR;
-  } else {
-    return B2FS_GENERIC_ERROR;
-  }
-}
-
-int parse_config(b2_account_t *auth, char *config_file) {
-  FILE *config = fopen(config_file, "r");
-  char keybuf[B2FS_SMALL_GENERIC_BUFFER], valbuf[B2FS_SMALL_GENERIC_BUFFER];
-  memset(auth, 0, sizeof(b2_account_t));
-
-  if (config) {
-    for (int i = 0; i < 3; i++) {
-      int retval = fscanf(config, "%s %s\n", keybuf, valbuf);
-      if (retval != 2) break;
-
-      if (!strcmp(keybuf, "account_id:")) {
-        strcpy(auth->account_id, valbuf);
-      } else if (!strcmp(keybuf, "app_key:")) {
-        strcpy(auth->app_key, valbuf);
-      } else if (!strcmp(keybuf, "bucket:")) {
-        strcpy(auth->bucket_id, valbuf);
-      } else {
-        write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
-      }
-    }
-    return B2FS_SUCCESS;
-  } else {
-    return B2FS_GENERIC_ERROR;
-  }
 }
 
 int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
@@ -882,6 +791,182 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
     }
   } else {
     curl_easy_cleanup(curl);
+    return B2FS_GENERIC_ERROR;
+  }
+}
+
+int init_file_entry(b2fs_file_entry_t *entry, int size) {
+  if (!entry) return B2FS_INVAL;
+
+  memset(entry, 0, sizeof(b2fs_file_entry_t));
+  entry->chunkmap = create_bitmap(size ? size : B2FS_INIT_CHUNK_NUM);
+  entry->chunks = create_keytree(free, free, intcmp, sizeof(int), sizeof(b2fs_file_chunk_t));
+  if (!entry->chunkmap || !entry->chunks) {
+    if (entry->chunkmap) free(entry->chunkmap);
+    if (entry->chunks) free(entry->chunks);
+    return B2FS_NOMEM;
+  }
+
+  return B2FS_SUCCESS;
+}
+
+void destroy_file_entry(void *voidarg) {
+  b2fs_file_entry_t *entry = voidarg;
+  keytree_destroy(entry->chunks);
+  destroy_bitmap(entry->chunkmap);
+  free(entry);
+}
+
+void destroy_hash_entry(void *voidarg) {
+  b2fs_hash_entry_t *entry = voidarg;
+
+  // Identify entry type and destroy.
+  if (entry->type == TYPE_DIRECTORY) hash_destroy(entry->directory);
+  else destroy_file_entry(&entry->file);
+}
+
+char **split_path(char *path) {
+  char **parts = malloc(sizeof(char *) * B2FS_SMALL_GENERIC_BUFFER), *strtok_ptr;
+  int size = B2FS_SMALL_GENERIC_BUFFER, counter = 0;
+
+  // Iterate across string, reallocating as we go, and store token pointers.
+  for (char *current = strtok_r(path, "/", &strtok_ptr); current; current = strtok_r(NULL, "/", &strtok_ptr)) {
+    if (counter == size - 1) {
+      void *tmp = realloc(parts, size *= 2);
+      if (!tmp) {
+        free(parts);
+        return NULL;
+      }
+      parts = tmp;
+    }
+    parts[counter++] = current;
+  }
+  parts[counter++] = NULL;
+
+  return parts;
+}
+
+hash_t *make_path(char **path_pieces, hash_t *base) {
+  hash_t *current = base;
+  int i = 0;
+
+  // Iterate across path pieces and create all intermediate directories.
+  for (char *piece = path_pieces[i++]; path_pieces[i]; piece = path_pieces[i++]) {
+    b2fs_hash_entry_t entry;
+    int retval = hash_get(current, piece, &entry);
+
+    if (retval != HASH_SUCCESS) {
+      // Create a new hash entry of type directory.
+      b2fs_hash_entry_t new_entry;
+      new_entry.type = TYPE_DIRECTORY;
+      new_entry.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
+
+      // Put it in the previous directory.
+      hash_put(current, piece, &new_entry);
+      hash_get(current, piece, &entry);
+    } else if (entry.type != TYPE_DIRECTORY) {
+      // An intermediate piece was not a directory. Give up and return.
+      return NULL;
+    }
+
+    current = entry.directory;
+  }
+
+  // Move final piece up to front of array for ease of access.
+  path_pieces[0] = path_pieces[i - 1];
+
+  // Return the directory containing the file.
+  return current;
+}
+
+b2fs_hash_entry_t *find_path(char *path, hash_t *base) {
+  char **path_pieces = split_path(path);
+  int i = 0;
+  hash_t *current = base;
+
+  b2fs_hash_entry_t *entry = NULL;
+  for (char *piece = path_pieces[i++]; path_pieces[i - 1]; piece = path_pieces[i++]) {
+    // Get the entry and perform basic validation.
+    int retval = hash_get(current, piece, &entry);
+    if (retval != HASH_SUCCESS || (entry->type == TYPE_FILE && path_pieces[i])) return NULL;
+
+    if (entry->type == TYPE_DIRECTORY) current = entry->directory;
+  }
+
+  // Return whatever we found.
+  return entry;
+}
+
+int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
+  if (tok->type != JSMN_STRING) return 0;
+  if (((int) strlen(s)) != (tok->end - tok->start)) return 0;
+  if (strncmp(json + tok->start, s, tok->end - tok->start)) return 0;
+  return 1;
+}
+
+void cache_auth(b2fs_state_t *b2_info) {
+  char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
+
+  // Locate system tmpdir if possible.
+  find_tmpdir(&tmpdir);
+  if (!tmpdir) return;
+
+  // Open cache file.
+  sprintf(path, "%s/b2fs_cache.txt", tmpdir);
+  FILE *cache_out = fopen(path, "w+");
+
+  // Write it out.
+  if (cache_out) {
+    fprintf(cache_out, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
+    fclose(cache_out);
+  }
+}
+
+int find_cached_auth(b2fs_state_t *b2_info) {
+  char *tmpdir, path[B2FS_SMALL_GENERIC_BUFFER];
+  memset(b2_info, 0, sizeof(b2fs_state_t));
+
+  // Locate system tmpdir if possible.
+  find_tmpdir(&tmpdir);
+  if (!tmpdir) return B2FS_GENERIC_ERROR;
+
+  // Open cache file.
+  sprintf(path, "%s/b2fs_cache.txt", tmpdir);
+  FILE *cache_in = fopen(path, "r");
+
+  // Read the cached info in.
+  if (cache_in) {
+    int success;
+    fscanf(cache_in, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
+    success = strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url);
+    return success ? B2FS_SUCCESS : B2FS_GENERIC_ERROR;
+  } else {
+    return B2FS_GENERIC_ERROR;
+  }
+}
+
+int parse_config(b2_account_t *auth, char *config_file) {
+  FILE *config = fopen(config_file, "r");
+  char keybuf[B2FS_SMALL_GENERIC_BUFFER], valbuf[B2FS_SMALL_GENERIC_BUFFER];
+  memset(auth, 0, sizeof(b2_account_t));
+
+  if (config) {
+    for (int i = 0; i < 3; i++) {
+      int retval = fscanf(config, "%s %s\n", keybuf, valbuf);
+      if (retval != 2) break;
+
+      if (!strcmp(keybuf, "account_id:")) {
+        strcpy(auth->account_id, valbuf);
+      } else if (!strcmp(keybuf, "app_key:")) {
+        strcpy(auth->app_key, valbuf);
+      } else if (!strcmp(keybuf, "bucket:")) {
+        strcpy(auth->bucket_id, valbuf);
+      } else {
+        write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
+      }
+    }
+    return B2FS_SUCCESS;
+  } else {
     return B2FS_GENERIC_ERROR;
   }
 }
