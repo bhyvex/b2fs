@@ -9,6 +9,7 @@
 #define B2FS_NETWORK_ACCESS_ERROR -0x0100
 #define B2FS_NETWORK_INTERN_ERROR -0x0101
 #define B2FS_NETWORK_API_ERROR -0x0102
+#define B2FS_FS_NOTDIR_ERROR -0x0200
 
 // Numerical Constants.
 #define B2FS_ACCOUNT_ID_LEN 16
@@ -171,7 +172,7 @@ void destroy_hash_entry(void *voidarg);
 // Filesystem Helpers.
 char **split_path(char *path);
 hash_t *make_path(char **path_pieces, hash_t *base);
-b2fs_hash_entry_t *find_path(char *path, hash_t *base);
+int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf);
 
 // Generic Helper Functions.
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
@@ -491,7 +492,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
 
-  return NULL;
+  return state;
 }
 
 // TODO: Implement this function.
@@ -503,18 +504,25 @@ void b2fs_destroy(void *userdata) {
 int b2fs_getattr(const char *path, struct stat *statbuf) {
   b2fs_state_t *state = fuse_get_context()->private_data;
 
-  char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
-  strcpy(path_copy, path);
-  b2fs_hash_entry_t *entry = find_path(path_copy, state->fs_cache);
-  free(path_copy);
+  int retval;
+  b2fs_hash_entry_t entry;
+  if (strcmp(path, "/")) {
+    char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
+    strcpy(path_copy, path);
+    retval = find_path(path_copy, state->fs_cache, &entry);
+    free(path_copy);
+  } else {
+    entry.type = TYPE_DIRECTORY;
+    retval = B2FS_SUCCESS;
+  }
 
   // Check if entry was found.
-  if (entry) {
+  if (retval == B2FS_SUCCESS) {
     // Entry exists. Initialize and set values for stat struct.
     memset(statbuf, 0, sizeof(struct stat));
 
     // Set file/directory flags.
-    if (entry->type == TYPE_FILE) statbuf->st_mode |= S_IFREG;
+    if (entry.type == TYPE_FILE) statbuf->st_mode |= S_IFREG;
     else statbuf->st_mode |= S_IFDIR;
 
     // Set read-write-execute permissions for everyone.
@@ -527,20 +535,20 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
     // Set other unsupported fields to sane defaults.
     statbuf->st_nlink = 1;
     statbuf->st_blksize = 512;
-    statbuf->st_blocks = entry->type == TYPE_FILE ? ceil(entry->file.size / (float) 512) : 1;
+    statbuf->st_blocks = entry.type == TYPE_FILE ? ceil(entry.file.size / (float) 512) : 1;
 
     // Set file access dates.
     // FIXME: I'm assuming these should be UNIX timestamps, but POSIX seems to be a little unsure.
     // Should probably come up with a better default than 0 for directories. Maybe when I'm feeling
     // less lazy I could scan across the contents to find the lowest timestamp.
-    if (entry->type == TYPE_FILE) {
-      statbuf->st_atime = entry->file.timestamp;
-      statbuf->st_mtime = entry->file.timestamp;
-      statbuf->st_ctime = entry->file.timestamp;
+    if (entry.type == TYPE_FILE) {
+      statbuf->st_atime = entry.file.timestamp;
+      statbuf->st_mtime = entry.file.timestamp;
+      statbuf->st_ctime = entry.file.timestamp;
     }
 
     // FIXME: Should directories return size 0?
-    if (entry->type == TYPE_FILE) statbuf->st_size = entry->file.size;
+    if (entry.type == TYPE_FILE) statbuf->st_size = entry.file.size;
 
     return B2FS_SUCCESS;
   } else {
@@ -557,19 +565,67 @@ int b2fs_readlink(const char *path, char *buf, size_t size) {
   return -ENOTSUP;
 }
 
-// TODO: Implement this function.
+// FIXME: Doesn't seem like this function actually needs to do very much in our case.
+// Currently only performs validation that the path given is, indeed, a directory.
 int b2fs_opendir(const char *path, struct fuse_file_info *info) {
-  return -ENOTSUP;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  // If the user is requesting to open /, automatically return success.
+  if (strcmp(path, "/")) {
+    // Get the entry from the cache.
+    b2fs_hash_entry_t entry;
+    char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
+    strcpy(path_copy, path);
+    int retval = find_path(path_copy, state->fs_cache, &entry);
+    free(path_copy);
+
+    // Perform validation and return.
+    if (retval == B2FS_SUCCESS) return entry.type == TYPE_DIRECTORY ? B2FS_SUCCESS : -ENOTDIR;
+    else return -ENOENT;
+  } else {
+    return B2FS_SUCCESS;
+  }
 }
 
 // TODO: Implement this function.
 int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *info) {
-  return -ENOTSUP;
+  (void) offset;
+  (void) info;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  hash_t *directory;
+  if (strcmp(path, "/")) {
+    // Find requested directory.
+    b2fs_hash_entry_t entry;
+    char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
+    strcpy(path_copy, path);
+    int retval = find_path(path_copy, state->fs_cache, &entry);
+    free(path_copy);
+
+    // Should be impossible for find_path to return an error if this code is correct.
+    assert(retval == B2FS_SUCCESS);
+    
+    // I'm assuming that all necessary validation for the path is done by b2fs_opendir, and that we
+    // already know that the given path exists and is a directory.
+    directory = entry.directory;
+  } else {
+    // User is asking to open /. Just use fs_cache.
+    directory = state->fs_cache;
+  }
+
+  // Iterate across the keys and pass them to the filler function.
+  int num_entries;
+  char **keys = hash_keys(directory, &num_entries);
+  for (int i = 0; i < num_entries; i++) filler(buf, keys[i], NULL, 0);
+  free(keys);
+
+  return B2FS_SUCCESS;
 }
 
-// TODO: Implement this function.
+// There isn't really anything to do in this function. Opendir doesn't maintain any state, so, for now
+// this just returns success.
 int b2fs_releasedir(const char *path, struct fuse_file_info *info) {
-  return -ENOTSUP;
+  return B2FS_SUCCESS;
 }
 
 // TODO: Implement this function.
@@ -668,9 +724,24 @@ int b2fs_flush(const char *path, struct fuse_file_info *info) {
   return -ENOTSUP;
 }
 
+// B2FS doesn't currently support permissions, so this just checks that the
+// entry in question actually exists and returns success.
 int b2fs_access(const char *path, int mode) {
-  (void) path;
-  (void) mode;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  if (strcmp(path, "/")) {
+    b2fs_hash_entry_t entry;
+    char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
+    strcpy(path_copy, path);
+    int retval = find_path(path_copy, state->fs_cache, &entry);
+    free(path_copy);
+
+    return retval;
+  } else {
+    // User is trying to access root directory. Always exists.
+    return B2FS_SUCCESS;
+  }
+
   return -ENOTSUP;
 }
 
@@ -879,22 +950,23 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
   return current;
 }
 
-b2fs_hash_entry_t *find_path(char *path, hash_t *base) {
+int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf) {
   char **path_pieces = split_path(path);
   int i = 0;
   hash_t *current = base;
 
-  b2fs_hash_entry_t *entry = NULL;
+  b2fs_hash_entry_t entry;
   for (char *piece = path_pieces[i++]; path_pieces[i - 1]; piece = path_pieces[i++]) {
     // Get the entry and perform basic validation.
     int retval = hash_get(current, piece, &entry);
-    if (retval != HASH_SUCCESS || (entry->type == TYPE_FILE && path_pieces[i])) return NULL;
+    if (retval != HASH_SUCCESS || (entry.type == TYPE_FILE && path_pieces[i])) return B2FS_FS_NOTDIR_ERROR;
 
-    if (entry->type == TYPE_DIRECTORY) current = entry->directory;
+    if (entry.type == TYPE_DIRECTORY) current = entry.directory;
   }
 
   // Return whatever we found.
-  return entry;
+  memcpy(buf, &entry, sizeof(b2fs_hash_entry_t));
+  return B2FS_SUCCESS;
 }
 
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {

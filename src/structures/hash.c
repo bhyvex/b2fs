@@ -236,17 +236,28 @@ int hash_drop(hash_t *table, char *key) {
   }
 }
 
+int hash_count(hash_t *table) {
+  if (!table) return HASH_INVAL_ERROR;
+  return table->count;
+}
+
 // Function handles the enumeration of all keys currently stored in hash.
 // Returns said keys in any order.
-char **hash_keys(hash_t *table) {
+// Uses the count arg as a out-var to "atomically" return the current count of keys.
+// When retrieving values for these keys, should always check return value as another
+// thread could have removed them in the intervening time.
+char **hash_keys(hash_t *table, int *count) {
   if (!table) return NULL;
 
-  // Allocate key array.
+  // Allocate key array if the hash contains elements. If not, we should never
+  // reference it during the loop, so it should be ok to leave it as NULL.
   int current = 0;
-  char **keys = (char **) malloc(sizeof(char *) * table->count);
+  char **keys = NULL;
+  if (table->count) keys = malloc(sizeof(char *) * table->count);
 
   // Iterate across each array index, and each hash_node chain.
   pthread_rwlock_rdlock(&table->lock);
+  *count = table->count;
   for (int i = 0; i < table->size; i++) {
     if (table->data[i]) {
       for (hash_node_t *tmp = table->data[i]; tmp; tmp = tmp->next) {
