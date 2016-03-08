@@ -16,11 +16,11 @@
 #define B2FS_ACCOUNT_ID_LEN 16
 #define B2FS_APP_KEY_LEN 64
 #define B2FS_TOKEN_LEN 128
+#define B2FS_MICRO_GENERIC_BUFFER 64
 #define B2FS_SMALL_GENERIC_BUFFER 256
 #define B2FS_MED_GENERIC_BUFFER 1024
 #define B2FS_LARGE_GENERIC_BUFFER 4096
 #define B2FS_CHUNK_SIZE (1024 * 1024 * 4)
-#define B2FS_INIT_CHUNK_NUM 10
 
 #define FUSE_USE_VERSION 30
 
@@ -47,6 +47,7 @@
 #include "structures/hash.h"
 #include "structures/array.h"
 #include "structures/bitmap.h"
+#include "structures/stack.h"
 #include "structures/keytree.h"
 
 /*----- Macro Declarations -----*/
@@ -89,6 +90,13 @@ typedef enum b2fs_loglevel {
   LEVEL_ERROR
 } b2fs_loglevel_t;
 
+typedef enum b2fs_delete_policy {
+  POLICY_INVAL,
+  POLICY_HIDE,
+  POLICY_DELETE_ONE,
+  POLICY_DELETE_ALL
+} b2fs_delete_policy_t;
+
 typedef enum b2fs_entry_type {
   TYPE_DIRECTORY,
   TYPE_FILE
@@ -99,22 +107,29 @@ typedef struct b2fs_string {
   unsigned int len, ptr;
 } b2fs_string_t;
 
-typedef struct b2_account {
+typedef struct b2fs_config {
   char account_id[B2FS_ACCOUNT_ID_LEN];
   char app_key[B2FS_APP_KEY_LEN];
   char bucket_id[B2FS_SMALL_GENERIC_BUFFER];
-} b2_account_t;
+  char mount_point[B2FS_SMALL_GENERIC_BUFFER];
+  b2fs_delete_policy_t policy;
+} b2fs_config_t;
+
+typedef struct b2fs_file_version {
+  char version_id[B2FS_SMALL_GENERIC_BUFFER];
+  char action[B2FS_MICRO_GENERIC_BUFFER];
+  int size;
+} b2fs_file_version_t;
 
 typedef struct b2fs_file_chunk {
-  int chunk_num;
+  int chunk_num, size;
   char data[B2FS_CHUNK_SIZE];
 } b2fs_file_chunk_t;
 
 typedef struct b2fs_file_entry {
   bitmap_t *chunkmap;
-  keytree_t *chunks;
-  char id[B2FS_SMALL_GENERIC_BUFFER];
-  int readers, writers, size, timestamp, version;
+  keytree_t *chunks, *versions;
+  int readers, writers;
 } b2fs_file_entry_t;
 
 typedef struct b2fs_hash_entry {
@@ -128,6 +143,7 @@ typedef struct b2fs_hash_entry {
 typedef struct b2fs_state {
   char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];
   char down_url[B2FS_TOKEN_LEN], bucket[B2FS_SMALL_GENERIC_BUFFER];
+  b2fs_delete_policy_t policy;
   hash_t *fs_cache;
 } b2fs_state_t;
 
@@ -163,10 +179,10 @@ int b2fs_access(const char *path, int mode);
 
 // Network Functions.
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
-int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info);
+int attempt_authentication(b2fs_config_t *config, b2fs_state_t *b2_info);
 
 // Struct Initializers.
-int init_file_entry(b2fs_file_entry_t *entry, int size);
+int init_file_entry(b2fs_file_entry_t *entry);
 void destroy_file_entry(void *voidarg);
 void destroy_hash_entry(void *voidarg);
 
@@ -180,28 +196,33 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type);
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
 void cache_auth(b2fs_state_t *b2_info);
 int find_cached_auth(b2fs_state_t *b2_info);
-int parse_config(b2_account_t *auth, char *config_file);
+int parse_config(b2fs_config_t *config, char *config_filename);
 void find_tmpdir(char **out);
 int intcmp(void *int_one, void *int_two);
+int rev_intcmp(void *int_one, void *int_two);
 void print_usage(int intentional);
 
 /*----- Local Function Implementations -----*/
 
 int main(int argc, char **argv) {
-  int c, index, retval;
-  b2_account_t account;
+  int c, index, retval, config_requested = 0;
+  b2fs_config_t config;
   b2fs_state_t b2_info;
-  char *config = "b2fs.yml", *mount_point = NULL, *bucket = NULL;
+  char *config_file = "b2fs.yml", *mount_point = NULL;
   char *debug = "-d", *single_threaded = "-s";
   struct option long_options[] = {
+    {"account-id", required_argument, 0, 'a'},
     {"bucket", required_argument, 0, 'b'},
     {"config", required_argument, 0, 'c'},
     {"debug", no_argument, 0, 'd'},
+    {"app-key", required_argument, 0, 'k'},
     {"mount", required_argument, 0, 'm'},
+    {"delete-policy", required_argument, 0, 'p'},
     {"single-threaded", no_argument, 0, 's'},
     {0, 0, 0, 0}
   };
   array_t *fuse_options = create_array(sizeof(char *), NULL);
+  memset(&config, 0, sizeof(b2fs_config_t));
 
   // Create FUSE function mapping.
   struct fuse_operations mappings = {
@@ -232,23 +253,44 @@ int main(int argc, char **argv) {
   };
 
   // Get CLI options.
-  while ((c = getopt_long(argc, argv, "b:c:dem:s", long_options, &index)) != -1) {
+  while ((c = getopt_long(argc, argv, "b:c:dem:p:s", long_options, &index)) != -1) {
     switch (c) {
+      case 'a':
+        if (strlen(optarg) > B2FS_ACCOUNT_ID_LEN - 1) {
+          write_log(LEVEL_ERROR, "B2FS: Account id too long. Max length is %d.\n", B2FS_ACCOUNT_ID_LEN);
+          print_usage(0);
+        }
+        strcpy(config.account_id, optarg);
+        break;
       case 'b': 
         if (strlen(optarg) > B2FS_SMALL_GENERIC_BUFFER - 1) {
           write_log(LEVEL_ERROR, "B2FS: Bucket name too long. Max length is %d.\n", B2FS_SMALL_GENERIC_BUFFER);
           print_usage(0);
         }
-        bucket = optarg;
+        strcpy(config.bucket_id, optarg);
         break;
       case 'c':
-        config = optarg;
+        config_requested = 1;
+        config_file = optarg;
         break;
       case 'd':
         array_push(fuse_options, &debug);
         break;
+      case 'k':
+        if (strlen(optarg) > B2FS_APP_KEY_LEN) {
+          write_log(LEVEL_ERROR, "B2FS: App key too long. Max length is %d.\n", B2FS_APP_KEY_LEN);
+          print_usage(0);
+        }
+        strcpy(config.app_key, optarg);
+        break;
       case 'm':
         mount_point = optarg;
+        break;
+      case 'p':
+        if (!strcmp("hide", optarg)) config.policy = POLICY_HIDE;
+        else if (!strcmp("delete", optarg)) config.policy = POLICY_DELETE_ONE;
+        else if (!strcmp("delete_all", optarg)) config.policy = POLICY_DELETE_ALL;
+        else print_usage(0);
         break;
       case 's':
         array_push(fuse_options, &single_threaded);
@@ -265,19 +307,23 @@ int main(int argc, char **argv) {
   retval = find_cached_auth(&b2_info);
 
   // Get account information from the config file if not cached.
-  memset(&account, 0, sizeof(b2_account_t));
-  if (parse_config(&account, config)) {
+  if (parse_config(&config, config_file)) {
     write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
     exit(EXIT_FAILURE);
-  } else if (!mount_point || (!strlen(account.bucket_id) && !bucket)) {
-    write_log(LEVEL_ERROR, "B2FS: At the very least, you must specify a mount point and a bucket id.\n");
-    print_usage(0);
   }
-  if (!bucket) bucket = account.bucket_id;
+
+  // Validate given options.
+  if (config.policy == POLICY_INVAL) config.policy = POLICY_HIDE;
+  if (!mount_point && !strlen(config.mount_point)) {
+    write_log(LEVEL_ERROR, "B2FS: You must specify a mount point.\n");
+    print_usage(0);
+  } else if (!mount_point) {
+    mount_point = config.mount_point;
+  }
 
   if (retval) {
     // Attempt to grab authentication token from B2.
-    retval = attempt_authentication(&account, &b2_info);
+    retval = attempt_authentication(&config, &b2_info);
 
     // Check response.
     switch (retval) {
@@ -305,7 +351,7 @@ int main(int argc, char **argv) {
   }
 
   // We are authenticated and have a valid token. Start up FUSE.
-  strcpy(b2_info.bucket, bucket);
+  strcpy(b2_info.bucket, config.bucket_id);
 
   // Get CLI arguments ready for FUSE.
   argv[1] = mount_point;
@@ -337,13 +383,15 @@ void *b2fs_init(struct fuse_conn_info *info) {
   CURLcode res;
   CURL *curl = curl_easy_init();
   char urlbuf[B2FS_SMALL_GENERIC_BUFFER], start_filename[B2FS_SMALL_GENERIC_BUFFER];
-  char auth[B2FS_SMALL_GENERIC_BUFFER], body[B2FS_SMALL_GENERIC_BUFFER];
+  char start_fileid[B2FS_SMALL_GENERIC_BUFFER], auth[B2FS_SMALL_GENERIC_BUFFER];
+  char body[B2FS_SMALL_GENERIC_BUFFER];
   b2fs_string_t response;
   memset(&response, 0, sizeof(b2fs_string_t));
 
   // Generate and set url for request.
-  sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_names");
+  sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_versions");
   memset(start_filename, 0, B2FS_SMALL_GENERIC_BUFFER);
+  memset(start_fileid, 0, B2FS_SMALL_GENERIC_BUFFER);
   curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
   curl_easy_setopt(curl, CURLOPT_POST, 1L);
 
@@ -358,12 +406,18 @@ void *b2fs_init(struct fuse_conn_info *info) {
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
   // Loop until all files have been loaded.
-  while (strcmp(start_filename, "null")) {
+  while (strcmp(start_filename, "null") && strcmp(start_fileid, "null")) {
     // Set POST body.
-    if (strlen(start_filename)) {
-      sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"maxFileCount\":1000}", state->bucket, start_filename);
+    if (strlen(start_filename) || strlen(start_fileid)) {
+      // Quick sanity checking.
+      assert(strlen(start_filename) && strlen(start_fileid));
+
+      // I hate putting single calls on multiple lines, but this is otherwise too long.
+      sprintf(body,
+          "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"startFileId\":\"%s\",\"maxFileCount\":1000}",
+          state->bucket, start_filename, start_fileid);
     } else {
-      sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":100}", state->bucket);
+      sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":1000}", state->bucket);
     }
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
@@ -404,8 +458,9 @@ void *b2fs_init(struct fuse_conn_info *info) {
           }
         }
 
-        // Zero start_filename to ensure null termination.
+        // Zero start_filename and start_fileid to ensure null termination.
         memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+        memset(start_fileid, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
         for (int i = 1; i < token_count; i++) {
           jsmntok_t *key = &tokens[i++], *value = &tokens[i++];
           int len = value->end - value->start, token_index = i;
@@ -414,7 +469,8 @@ void *b2fs_init(struct fuse_conn_info *info) {
             for (int j = 0; j < value->size; j++) {
               jsmntok_t *file = &tokens[token_index++];
               b2fs_hash_entry_t entry;
-              char **path_pieces, filename[B2FS_SMALL_GENERIC_BUFFER], file_id[B2FS_SMALL_GENERIC_BUFFER];
+              b2fs_file_version_t version;
+              char **path_pieces, filename[B2FS_SMALL_GENERIC_BUFFER];
               long size, timestamp;
 
               // Parse out file path pieces and file size.
@@ -431,24 +487,26 @@ void *b2fs_init(struct fuse_conn_info *info) {
                 } else if (jsmn_iskey(response.str, obj_key, "uploadTimestamp")) {
                   timestamp = strtol(response.str + obj_value->start, NULL, 10);
                 } else if (jsmn_iskey(response.str, obj_key, "fileId")) {
-                  memset(filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-                  memcpy(file_id, response.str + obj_value->start, obj_len);
+                  memset(version.version_id, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+                  memcpy(version.version_id, response.str + obj_value->start, obj_len);
+                } else if (jsmn_iskey(response.str, obj_key, "action")) {
+                  memset(version.action, 0, sizeof(char) * B2FS_MICRO_GENERIC_BUFFER);
+                  memcpy(version.action, response.str + obj_value->start, obj_len);
                 }
               }
 
               // Make all intermediate directories.
               hash_t *dir = make_path(path_pieces, state->fs_cache);
 
-              // Initialize file entry.
-              int num_chunks = ceil(ceil(size / (float) B2FS_CHUNK_SIZE) / (float) 8);
-              init_file_entry(&entry.file, num_chunks);
-              entry.type = TYPE_FILE;
-              entry.file.size = size;
-              entry.file.timestamp = timestamp;
-              strcpy(entry.file.id, file_id);
-
-              // Put it in the directory cache.
-              hash_put(dir, path_pieces[0], &entry);
+              if (hash_get(dir, path_pieces[0], &entry) != HASH_SUCCESS) {
+                // Hash entry does not exist. This is the first time we've seen this file.
+                entry.type = TYPE_FILE;
+                init_file_entry(&entry.file);
+                hash_put(dir, path_pieces[0], &entry);
+              }
+              assert(strlen(version.action) > 0 && strlen(version.version_id) > 0);
+              version.size = size;
+              keytree_insert(entry.file.versions, &timestamp, &version);
 
               // Clean up and prepare for next iteration.
               free(path_pieces);
@@ -458,6 +516,8 @@ void *b2fs_init(struct fuse_conn_info *info) {
             token_index--;
           } else if (jsmn_iskey(response.str, key, "nextFileName")) {
             memcpy(start_filename, response.str + value->start, len);
+          } else if (jsmn_iskey(response.str, key, "nextFileId")) {
+            memcpy(start_fileid, response.str + value->start, len);
           } else {
             // We received an unknown key from B2. Log it, but try to keep going.
             LOG_KEY(response.str, key, "b2fs_init");
@@ -508,6 +568,7 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
 
   int retval;
   b2fs_hash_entry_t entry;
+  b2fs_file_version_t version;
   if (strcmp(path, "/")) {
     char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
     strcpy(path_copy, path);
@@ -534,23 +595,31 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
     statbuf->st_uid = ROOT_UID;
     statbuf->st_gid = ROOT_GID;
 
+    // Get info for most recent file version.
+    int timestamp;
+    if (entry.type == TYPE_FILE) {
+      keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
+      keytree_iterate_next(it, &timestamp, &version);
+      keytree_iterate_stop(it);
+    }
+
     // Set other unsupported fields to sane defaults.
     statbuf->st_nlink = 1;
     statbuf->st_blksize = 512;
-    statbuf->st_blocks = entry.type == TYPE_FILE ? ceil(entry.file.size / (float) 512) : 1;
+    statbuf->st_blocks = entry.type == TYPE_FILE ? ceil(version.size / (float) 512) : 1;
 
     // Set file access dates.
     // FIXME: I'm assuming these should be UNIX timestamps, but POSIX seems to be a little unsure.
     // Should probably come up with a better default than 0 for directories. Maybe when I'm feeling
     // less lazy I could scan across the contents to find the lowest timestamp.
     if (entry.type == TYPE_FILE) {
-      statbuf->st_atime = entry.file.timestamp;
-      statbuf->st_mtime = entry.file.timestamp;
-      statbuf->st_ctime = entry.file.timestamp;
+      statbuf->st_atime = timestamp;
+      statbuf->st_mtime = timestamp;
+      statbuf->st_ctime = timestamp;
     }
 
     // FIXME: Should directories return size 0?
-    if (entry.type == TYPE_FILE) statbuf->st_size = entry.file.size;
+    if (entry.type == TYPE_FILE) statbuf->st_size = version.size;
 
     return B2FS_SUCCESS;
   } else {
@@ -633,6 +702,9 @@ int b2fs_releasedir(const char *path, struct fuse_file_info *info) {
 }
 
 // Function only supports creating a regular file. Also, currently ignores permissions.
+// B2 doesn't support adding empty files, so this only modifies the local cache.
+// Local filesystem will report that the file exists, but if nothing is written to it
+// before the filesystem is shut down, it will not be persisted.
 int b2fs_mknod(const char *path, mode_t mode, dev_t rdev) {
   (void) rdev;
   b2fs_state_t *state = fuse_get_context()->private_data;
@@ -646,7 +718,10 @@ int b2fs_mknod(const char *path, mode_t mode, dev_t rdev) {
   }
 }
 
-// TODO: Implement this function.
+// Function creates a new directory. Currently ignores permissions.
+// B2 doesn't support adding empty directories, so this only modifies the local cache.
+// Local filesystem will report that the directory exists, but if nothing is added to
+// it before the filesystem is shut down, it will not be persisted.
 int b2fs_mkdir(const char *path, mode_t mode) {
   (void) mode;
   b2fs_state_t *state = fuse_get_context()->private_data;
@@ -782,7 +857,7 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
   return size * nmembers;
 }
 
-int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
+int attempt_authentication(b2fs_config_t *config, b2fs_state_t *b2_info) {
   CURL *curl;
   CURLcode res;
 
@@ -800,7 +875,7 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
     // Create token to send for authentication.
     base64_encodestate state;
     base64_init_encodestate(&state);
-    sprintf(conversionbuf, "%s:%s", auth->account_id, auth->app_key);
+    sprintf(conversionbuf, "%s:%s", config->account_id, config->app_key);
     tmp += base64_encode_block(conversionbuf, strlen(conversionbuf), tmp, &state);
     tmp += base64_encode_blockend(tmp, &state);
     *(--tmp) = '\0';
@@ -885,12 +960,13 @@ int attempt_authentication(b2_account_t *auth, b2fs_state_t *b2_info) {
   }
 }
 
-int init_file_entry(b2fs_file_entry_t *entry, int size) {
+int init_file_entry(b2fs_file_entry_t *entry) {
   if (!entry) return B2FS_INVAL;
 
   memset(entry, 0, sizeof(b2fs_file_entry_t));
-  entry->chunkmap = create_bitmap(size ? size : B2FS_INIT_CHUNK_NUM);
+  entry->chunkmap = create_bitmap();
   entry->chunks = create_keytree(free, free, intcmp, sizeof(int), sizeof(b2fs_file_chunk_t));
+  entry->versions = create_keytree(free, free, rev_intcmp, sizeof(int), sizeof(char *));
   if (!entry->chunkmap || !entry->chunks) {
     if (entry->chunkmap) free(entry->chunkmap);
     if (entry->chunks) free(entry->chunks);
@@ -996,7 +1072,7 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
 
   // Iterate across path and stop on last slash.
   for (char *curr = strstr(path, "/"); curr; end = curr, curr = strstr(curr + 1, "/"));
-  int path_len = end - path, filename_len = strlen(end);
+  int path_len = end - path, filename_len = strlen(++end);
   child_path = malloc(sizeof(char) * (filename_len + 1));
   strcpy(child_path, end);
 
@@ -1026,7 +1102,7 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
   // Initialize new directory entry for insertion.
   b2fs_hash_entry_t created;
   created.type = type;
-  if (type == TYPE_FILE) init_file_entry(&created.file, 0);
+  if (type == TYPE_FILE) init_file_entry(&created.file);
   else created.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
 
   // Insert the requested entry into the filesystem cache. B2 doesn't support empty files
@@ -1085,24 +1161,30 @@ int find_cached_auth(b2fs_state_t *b2_info) {
   }
 }
 
-int parse_config(b2_account_t *auth, char *config_file) {
-  FILE *config = fopen(config_file, "r");
+int parse_config(b2fs_config_t *config, char *config_filename) {
+  FILE *config_file = fopen(config_filename, "r");
   char keybuf[B2FS_SMALL_GENERIC_BUFFER], valbuf[B2FS_SMALL_GENERIC_BUFFER];
-  memset(auth, 0, sizeof(b2_account_t));
 
-  if (config) {
-    for (int i = 0; i < 3; i++) {
-      int retval = fscanf(config, "%s %s\n", keybuf, valbuf);
+  if (config_file) {
+    for (int i = 0; i < 5; i++) {
+      int retval = fscanf(config_file, "%s %s\n", keybuf, valbuf);
       if (retval != 2) break;
 
-      if (!strcmp(keybuf, "account_id:")) {
-        strcpy(auth->account_id, valbuf);
-      } else if (!strcmp(keybuf, "app_key:")) {
-        strcpy(auth->app_key, valbuf);
-      } else if (!strcmp(keybuf, "bucket:")) {
-        strcpy(auth->bucket_id, valbuf);
+      if (!strcmp(keybuf, "account_id:") && !strlen(config->account_id)) {
+        strcpy(config->account_id, valbuf);
+      } else if (!strcmp(keybuf, "bucket:") && !strlen(config->bucket_id)) {
+        strcpy(config->bucket_id, valbuf);
+      } else if (!strcmp(keybuf, "app_key:") && !strlen(config->app_key)) {
+        strcpy(config->app_key, valbuf);
+      } else if (!strcmp(keybuf, "mount:")) {
+        strcpy(config->mount_point, valbuf);
+      } else if (!strcmp(keybuf, "delete_policy:") && config->policy == POLICY_INVAL) {
+        if (!strcmp(valbuf, "hide")) config->policy = POLICY_HIDE;
+        else if (!strcmp(valbuf, "delete")) config->policy = POLICY_DELETE_ONE;
+        else if (!strcmp(valbuf, "delete_all")) config->policy = POLICY_DELETE_ALL;
+        else return B2FS_GENERIC_ERROR;
       } else {
-        write_log(LEVEL_ERROR, "B2FS: Malformed config file.\n");
+        return B2FS_GENERIC_ERROR;
       }
     }
     return B2FS_SUCCESS;
@@ -1130,6 +1212,10 @@ void find_tmpdir(char **out) {
 
 int intcmp(void *int_one, void *int_two) {
   return *((int *) int_one) - *((int *) int_two);
+}
+
+int rev_intcmp(void *int_one, void *int_two) {
+  return *((int *) int_two) - *((int *) int_one);
 }
 
 void print_usage(int intentional) {

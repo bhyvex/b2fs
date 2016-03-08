@@ -15,7 +15,7 @@ typedef struct bitmap bitmap_t;
 
 /*----- Function Declaractions -----*/
 
-bitmap_t *create_bitmap(int size);
+bitmap_t *create_bitmap();
 void destroy_bitmap(bitmap_t *bits);
 
 int set_bit(bitmap_t *bits, int bit);

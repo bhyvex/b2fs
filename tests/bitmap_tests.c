@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
   }
 
   // Allocate everything we'll need.
-  bitmap_t *map = create_bitmap(map_size), *double_check = create_bitmap(map_size);
+  bitmap_t *map = create_bitmap(), *double_check = create_bitmap();
   int **thread_bits = malloc(sizeof(int *) * num_threads);
   voidargs_t *args = malloc(sizeof(voidargs_t) * num_threads);
   pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);

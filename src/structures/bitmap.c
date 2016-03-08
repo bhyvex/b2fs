@@ -24,13 +24,13 @@ int reallocate(bitmap_t *map, int size);
 
 /*----- Function Implementations -----*/
 
-bitmap_t *create_bitmap(int size) {
+bitmap_t *create_bitmap() {
   bitmap_t *bits = malloc(sizeof(bitmap_t));
 
   if (bits) {
     memset(bits, 0, sizeof(bitmap_t));
-    bits->map = calloc(size ? sizeof(char) * size : sizeof(char) * BITMAP_DEFAULT_SIZE, 1);
-    bits->size = size;
+    bits->map = calloc(sizeof(char), BITMAP_DEFAULT_SIZE);
+    bits->size = BITMAP_DEFAULT_SIZE;
     pthread_rwlock_init(&bits->lock, NULL);
   }
 
