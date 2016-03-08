@@ -570,6 +570,7 @@ int b2fs_readlink(const char *path, char *buf, size_t size) {
 // FIXME: Doesn't seem like this function actually needs to do very much in our case.
 // Currently only performs validation that the path given is, indeed, a directory.
 int b2fs_opendir(const char *path, struct fuse_file_info *info) {
+  (void) info;
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   // If the user is requesting to open /, automatically return success.
@@ -589,7 +590,6 @@ int b2fs_opendir(const char *path, struct fuse_file_info *info) {
   }
 }
 
-// TODO: Implement this function.
 int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *info) {
   (void) offset;
   (void) info;
@@ -627,11 +627,14 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
 // There isn't really anything to do in this function. Opendir doesn't maintain any state, so, for now
 // this just returns success.
 int b2fs_releasedir(const char *path, struct fuse_file_info *info) {
+  (void) path;
+  (void) info;
   return B2FS_SUCCESS;
 }
 
 // Function only supports creating a regular file. Also, currently ignores permissions.
 int b2fs_mknod(const char *path, mode_t mode, dev_t rdev) {
+  (void) rdev;
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   if (S_ISREG(mode)) {
@@ -645,6 +648,7 @@ int b2fs_mknod(const char *path, mode_t mode, dev_t rdev) {
 
 // TODO: Implement this function.
 int b2fs_mkdir(const char *path, mode_t mode) {
+  (void) mode;
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   // Make the directory.
@@ -740,6 +744,7 @@ int b2fs_flush(const char *path, struct fuse_file_info *info) {
 // B2FS doesn't currently support permissions, so this just checks that the
 // entry in question actually exists and returns success.
 int b2fs_access(const char *path, int mode) {
+  (void) mode;
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   if (strcmp(path, "/")) {
@@ -749,13 +754,14 @@ int b2fs_access(const char *path, int mode) {
     int retval = find_path(path_copy, state->fs_cache, &entry);
     free(path_copy);
 
-    return retval;
+    // Error handling and return.
+    if (retval == B2FS_FS_NOENT_ERROR) return -ENOENT;
+    else if (retval == B2FS_FS_NOTDIR_ERROR) return -ENOTDIR;
+    else return retval;
   } else {
     // User is trying to access root directory. Always exists.
     return B2FS_SUCCESS;
   }
-
-  return -ENOTSUP;
 }
 
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
