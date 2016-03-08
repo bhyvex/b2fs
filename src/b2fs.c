@@ -10,6 +10,7 @@
 #define B2FS_NETWORK_INTERN_ERROR -0x0101
 #define B2FS_NETWORK_API_ERROR -0x0102
 #define B2FS_FS_NOTDIR_ERROR -0x0200
+#define B2FS_FS_NOENT_ERROR -0x0201
 
 // Numerical Constants.
 #define B2FS_ACCOUNT_ID_LEN 16
@@ -173,6 +174,7 @@ void destroy_hash_entry(void *voidarg);
 char **split_path(char *path);
 hash_t *make_path(char **path_pieces, hash_t *base);
 int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf);
+int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type);
 
 // Generic Helper Functions.
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s);
@@ -604,7 +606,7 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
 
     // Should be impossible for find_path to return an error if this code is correct.
     assert(retval == B2FS_SUCCESS);
-    
+
     // I'm assuming that all necessary validation for the path is done by b2fs_opendir, and that we
     // already know that the given path exists and is a directory.
     directory = entry.directory;
@@ -628,14 +630,25 @@ int b2fs_releasedir(const char *path, struct fuse_file_info *info) {
   return B2FS_SUCCESS;
 }
 
-// TODO: Implement this function.
+// Function only supports creating a regular file. Also, currently ignores permissions.
 int b2fs_mknod(const char *path, mode_t mode, dev_t rdev) {
-  return -ENOTSUP;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  if (S_ISREG(mode)) {
+    // We're making a regular file.
+    return internal_make(path, state->fs_cache, TYPE_FILE);
+  } else {
+    // We're being asked to create something other than a regular file. Not currently supported.
+    return -ENOTSUP;
+  }
 }
 
 // TODO: Implement this function.
 int b2fs_mkdir(const char *path, mode_t mode) {
-  return -ENOTSUP;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  // Make the directory.
+  return internal_make(path, state->fs_cache, TYPE_DIRECTORY);
 }
 
 int b2fs_symlink(const char *from, const char *to) {
@@ -959,7 +972,8 @@ int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf) {
   for (char *piece = path_pieces[i++]; path_pieces[i - 1]; piece = path_pieces[i++]) {
     // Get the entry and perform basic validation.
     int retval = hash_get(current, piece, &entry);
-    if (retval != HASH_SUCCESS || (entry.type == TYPE_FILE && path_pieces[i])) return B2FS_FS_NOTDIR_ERROR;
+    if (retval != HASH_SUCCESS) return B2FS_FS_NOENT_ERROR;
+    else if (entry.type == TYPE_FILE && path_pieces[i]) return B2FS_FS_NOTDIR_ERROR;
 
     if (entry.type == TYPE_DIRECTORY) current = entry.directory;
   }
@@ -967,6 +981,54 @@ int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf) {
   // Return whatever we found.
   memcpy(buf, &entry, sizeof(b2fs_hash_entry_t));
   return B2FS_SUCCESS;
+}
+
+int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
+  // We are being asked to create a normal file. Ensure that the parent directory exists.
+  char *end, *child_path;
+  hash_t *parent;
+
+  // Iterate across path and stop on last slash.
+  for (char *curr = strstr(path, "/"); curr; end = curr, curr = strstr(curr + 1, "/"));
+  int path_len = end - path, filename_len = strlen(end);
+  child_path = malloc(sizeof(char) * (filename_len + 1));
+  strcpy(child_path, end);
+
+  if (path_len) {
+    // We're creating a file somewhere other than the root.
+    char *parent_path = malloc(sizeof(char) * path_len);
+    memcpy(parent_path, path, path_len);
+    parent_path[path_len] = '\0';
+
+    // Attempt to locate the parent directory and return an error if it can't be found.
+    b2fs_hash_entry_t entry;
+    int retval = find_path(parent_path, base, &entry);
+    free(parent_path);
+    if (retval == B2FS_FS_NOTDIR_ERROR || entry.type != TYPE_DIRECTORY) {
+      free(child_path);
+      return -ENOTDIR;
+    } else if (retval == B2FS_FS_NOENT_ERROR) {
+      free(child_path);
+      return -ENOENT;
+    }
+    parent = entry.directory;
+  } else {
+    // We're inserting into the root directory.
+    parent = base;
+  }
+
+  // Initialize new directory entry for insertion.
+  b2fs_hash_entry_t created;
+  created.type = type;
+  if (type == TYPE_FILE) init_file_entry(&created.file, 0);
+  else created.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
+
+  // Insert the requested entry into the filesystem cache. B2 doesn't support empty files
+  // or directories, so we just need to keep track of the fact that it exists until the
+  // user decides to write some data.
+  int retval = hash_put(parent, child_path, &created);
+  if (retval == HASH_SUCCESS) return B2FS_SUCCESS;
+  else return -EEXIST;
 }
 
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
