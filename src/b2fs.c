@@ -118,7 +118,7 @@ typedef struct b2fs_config {
 typedef struct b2fs_file_version {
   char version_id[B2FS_SMALL_GENERIC_BUFFER];
   char action[B2FS_MICRO_GENERIC_BUFFER];
-  int size;
+  size_t size;
 } b2fs_file_version_t;
 
 typedef struct b2fs_file_chunk {
@@ -513,7 +513,6 @@ void *b2fs_init(struct fuse_conn_info *info) {
             }
 
             // Back up the token index for the outer loop.
-            token_index--;
           } else if (jsmn_iskey(response.str, key, "nextFileName")) {
             memcpy(start_filename, response.str + value->start, len);
           } else if (jsmn_iskey(response.str, key, "nextFileId")) {
@@ -524,7 +523,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
           }
 
           // Prepare for next iteration.
-          i = token_index;
+          i = --token_index;
         }
 
         // Clear the response string to prepare for the next iteration.
@@ -596,7 +595,7 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
     statbuf->st_gid = ROOT_GID;
 
     // Get info for most recent file version.
-    int timestamp;
+    size_t timestamp;
     if (entry.type == TYPE_FILE) {
       keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
       keytree_iterate_next(it, &timestamp, &version);
@@ -966,7 +965,7 @@ int init_file_entry(b2fs_file_entry_t *entry) {
   memset(entry, 0, sizeof(b2fs_file_entry_t));
   entry->chunkmap = create_bitmap();
   entry->chunks = create_keytree(free, free, intcmp, sizeof(int), sizeof(b2fs_file_chunk_t));
-  entry->versions = create_keytree(free, free, rev_intcmp, sizeof(int), sizeof(char *));
+  entry->versions = create_keytree(free, free, rev_intcmp, sizeof(size_t), sizeof(b2fs_file_version_t));
   if (!entry->chunkmap || !entry->chunks) {
     if (entry->chunkmap) free(entry->chunkmap);
     if (entry->chunks) free(entry->chunks);
