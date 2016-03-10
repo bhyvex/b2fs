@@ -269,7 +269,7 @@ int keytree_remove(keytree_t *tree, void *key, void *valbuf) {
       }
     } else {
       // Two children. Time to find the inorder successor.
-      stack_t *successor_stack = create_stack(free, sizeof(tree_node_t *));
+      stack_t *successor_stack = create_stack(NULL, sizeof(tree_node_t *));
       current = removed->right;
       while (current) {
         stack_push(successor_stack, &current);
@@ -412,8 +412,8 @@ int keytree_iterate_next(keytree_iterator_t *it, void *keybuf, void *valbuf) {
   pthread_rwlock_rdlock(it->lock);
 
   // Copy the data into the buffers for the current node.
-  memcpy(keybuf, it->curr->key, it->keysize);
-  memcpy(valbuf, it->curr->value, it->valsize);
+  if (keybuf) memcpy(keybuf, it->curr->key, it->keysize);
+  if (valbuf) memcpy(valbuf, it->curr->value, it->valsize);
 
   // Update references.
   __sync_fetch_and_sub(&it->curr->references, 1);
@@ -434,8 +434,8 @@ int keytree_iterate_prev(keytree_iterator_t *it, void *keybuf, void *valbuf) {
   pthread_rwlock_rdlock(it->lock);
 
   // Copy the data into the buffers for the current node.
-  memcpy(keybuf, it->curr->key, it->keysize);
-  memcpy(valbuf, it->curr->value, it->valsize);
+  if (keybuf) memcpy(keybuf, it->curr->key, it->keysize);
+  if (valbuf) memcpy(valbuf, it->curr->value, it->valsize);
 
   // Update references.
   __sync_fetch_and_sub(&it->curr->references, 1);
@@ -585,7 +585,6 @@ void wait_on_references(tree_node_t **nodes, int num_nodes, pthread_rwlock_t *lo
 void dereference_and_destroy(void *voidarg) {
   tree_node_t **node_ptr = voidarg;
   __sync_fetch_and_sub(&((*node_ptr)->references), 1);
-  free(node_ptr);
 }
 
 // Function takes care of destroying a tree node.

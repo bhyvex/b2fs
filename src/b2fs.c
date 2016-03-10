@@ -137,9 +137,8 @@ typedef struct b2fs_config {
 
 typedef struct b2fs_file_version {
   char version_id[B2FS_SMALL_GENERIC_BUFFER];
-  char action[B2FS_MICRO_GENERIC_BUFFER];
   size_t size;
-  int *should_delete;
+  int *should_delete, *hidden;
 } b2fs_file_version_t;
 
 typedef struct b2fs_file_chunk {
@@ -165,7 +164,6 @@ typedef struct b2fs_state {
   char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];
   char down_url[B2FS_TOKEN_LEN];
   b2fs_config_t config;
-  b2fs_delete_policy_t policy;
   hash_t *fs_cache, *id_mappings;
   pthread_rwlock_t lock;
 } b2fs_state_t;
@@ -207,6 +205,7 @@ int handle_authentication(b2fs_state_t *state, char *account_id, char *app_key);
 
 // Struct Initializers.
 int init_file_entry(b2fs_file_entry_t *entry);
+int init_file_version(b2fs_file_version_t *version);
 void destroy_file_entry(void *voidarg);
 void destroy_file_version(void *voidarg);
 void destroy_hash_entry(void *voidarg);
@@ -507,6 +506,9 @@ void *b2fs_init(struct fuse_conn_info *info) {
                 char **path_pieces, filename[B2FS_MED_GENERIC_BUFFER], *id_mapping;
                 long size, timestamp;
 
+                // Initialize this file version.
+                init_file_version(&version);
+
                 // Parse out file path pieces and file size.
                 for (int k = 0; k < file->size; k++) {
                   jsmntok_t *obj_key = &tokens[token_index++], *obj_value = &tokens[token_index++];
@@ -532,8 +534,10 @@ void *b2fs_init(struct fuse_conn_info *info) {
                     memset(version.version_id, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
                     memcpy(version.version_id, response.str + obj_value->start, obj_len);
                   } else if (jsmn_iskey(response.str, obj_key, "action")) {
-                    memset(version.action, 0, sizeof(char) * B2FS_MICRO_GENERIC_BUFFER);
-                    memcpy(version.action, response.str + obj_value->start, obj_len);
+                    // Set the  hidden flag if the action is set to hide.
+                    if (!strncmp(response.str + obj_value->start, "hide", obj_len)) {
+                      *version.hidden = 1;
+                    }
                   }
                 }
 
@@ -549,7 +553,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
                   init_file_entry(&entry.file);
                   hash_put(dir, path_pieces[0], &entry);
                 }
-                assert(strlen(version.action) > 0 && strlen(version.version_id) > 0);
+                assert(strlen(version.version_id) > 0);
                 version.size = size;
                 keytree_insert(entry.file.versions, &timestamp, &version);
 
@@ -587,6 +591,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
             do_again = 1;
             free(response.str);
             memset(&response, 0, sizeof(b2fs_string_t));
+            break;
           } else {
             // Error couldn't be handled. We're in the process of starting up, so just shutdown.
             write_log(LEVEL_ERROR, "B2FS: B2 returned an unexpected error during startup. This is most likely a bug. Go make a report\n");
@@ -639,6 +644,18 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
 
   // Check if entry was found.
   if (retval == B2FS_SUCCESS) {
+    if (entry.type == TYPE_FILE) {
+      b2fs_file_version_t version;
+
+      // Get most recent version of file.
+      keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
+      assert(keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS);
+      keytree_iterate_stop(it);
+
+      // Only provide attributes for the file if it's not hidden.
+      if (*version.hidden) return -ENOENT;
+    }
+
     // Entry exists. Initialize and set values for stat struct.
     memset(statbuf, 0, sizeof(struct stat));
 
@@ -745,7 +762,24 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
   // Iterate across the keys and pass them to the filler function.
   int num_entries;
   char **keys = hash_keys(directory, &num_entries);
-  for (int i = 0; i < num_entries; i++) filler(buf, keys[i], NULL, 0);
+  for (int i = 0; i < num_entries; i++) {
+    // Before returning the current file, we need to make sure it hasn't been hidden.
+    b2fs_hash_entry_t entry;
+    b2fs_file_version_t version;
+    assert(hash_get(directory, keys[i], &entry) == HASH_SUCCESS);
+
+    if (entry.type == TYPE_FILE) {
+      // Get the most recent version.
+      keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
+      assert(keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS);
+
+      // Return the entry if it's not hidden.
+      if (!*version.hidden) filler(buf, keys[i], NULL, 0);
+    } else {
+      filler(buf, keys[i], NULL, 0);
+    }
+
+  }
   free(keys);
 
   return B2FS_SUCCESS;
@@ -811,9 +845,9 @@ int b2fs_unlink(const char *path) {
 
     if (retval == B2FS_SUCCESS) {
       // File exists. Time to do the hard work.
-      if (state->policy != POLICY_HIDE) {
+      if (state->config.policy != POLICY_HIDE) {
         // Figure out how many files we need to delete.
-        int num_iterations = state->policy == POLICY_DELETE_ONE ? 1 : keytree_size(entry.file.versions);
+        int num_iterations = state->config.policy == POLICY_DELETE_ONE ? 1 : keytree_size(entry.file.versions);
 
         // Iterate over versions and mark for deletion.
         size_t key;
@@ -829,6 +863,16 @@ int b2fs_unlink(const char *path) {
         // Remove versions from the version tree (will call destructor to delete from B2).
         while (stack_pop(deletions, &key) == STACK_SUCCESS) keytree_remove(entry.file.versions, &key, NULL);
         destroy_stack(deletions);
+      }
+
+      // Remove the file from the filesystem cache if all versions have been removed.
+      if (!keytree_size(entry.file.versions)) {
+        path_copy = malloc(sizeof(char) * strlen(path) + 1);
+        strcpy(path_copy, path);
+        char **path_pieces = split_path(path_copy);
+        hash_t *parent = make_path(path_pieces, state->fs_cache);
+        assert(hash_drop(parent, path_pieces[0]) == HASH_SUCCESS);
+        free(path_copy);
       }
 
       // Hide the earliest remaining file if there is one.
@@ -867,6 +911,7 @@ int b2fs_unlink(const char *path) {
           // Get the name of the file exactly as B2 expects it and create the request body.
           assert(hash_get(state->id_mappings, version.version_id, &filename) == HASH_SUCCESS);
           sprintf(body, "{\"bucketId\":\"%s\",\"fileName\":\"%s\"}", state->config.bucket_id, filename);
+          curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
           // Perform the request.
           if ((res = curl_easy_perform(curl)) == CURLE_OK) {
@@ -876,6 +921,7 @@ int b2fs_unlink(const char *path) {
             if (code == 200) {
               // No need to check response. Hide API just returns info on the file that we already have, and the API docs state that
               // a 200 is sufficient to know that the file has been hidden.
+              *version.hidden = 1;
               free(response.str);
             } else {
               // FIXME: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to
@@ -1168,16 +1214,18 @@ int handle_authentication(b2fs_state_t *state, char *account_id, char *app_key) 
       }
 
       // Iterate over returned tokens and extract the needed info.
-      memset(state, 0, sizeof(b2fs_state_t));
       for (int i = 1; i < token_count; i++) {
         jsmntok_t *key = &tokens[i++], *value = &tokens[i];
         int len = value->end - value->start;
 
         if (jsmn_iskey(data.str, key, "authorizationToken")) {
+          memset(state->token, 0, sizeof(char) * B2FS_TOKEN_LEN);
           memcpy(state->token, data.str + value->start, len);
         } else if (jsmn_iskey(data.str, key, "apiUrl")) {
+          memset(state->api_url, 0, sizeof(char) * B2FS_TOKEN_LEN);
           memcpy(state->api_url, data.str + value->start, len);
         } else if (jsmn_iskey(data.str, key, "downloadUrl")) {
+          memset(state->down_url, 0, sizeof(char) * B2FS_TOKEN_LEN);
           memcpy(state->down_url, data.str + value->start, len);
         } else if (!jsmn_iskey(data.str, key, "accountId")) {
           LOG_KEY(data.str, key, "authentication");
@@ -1234,8 +1282,16 @@ int init_file_version(b2fs_file_version_t *version) {
 
   memset(version, 0, sizeof(b2fs_file_version_t));
   version->should_delete = malloc(sizeof(int));
-  if (version->should_delete) return B2FS_SUCCESS;
-  else return B2FS_NOMEM_ERROR;
+  version->hidden = malloc(sizeof(int));
+  *version->should_delete = 0;
+  *version->hidden = 0;
+  if (version->should_delete && version->hidden) {
+    return B2FS_SUCCESS;
+  } else {
+    if (version->should_delete) free(version->should_delete);
+    if (version->hidden) free(version->hidden);
+    return B2FS_NOMEM_ERROR;
+  }
 }
 
 void destroy_file_entry(void *voidarg) {
