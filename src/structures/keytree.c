@@ -594,3 +594,7 @@ void destroy_tree_node(tree_node_t *node, void (*key_destroy) (void *), void (*v
   if (val_destroy) val_destroy(node->value);
   free(node);
 }
+
+int keytree_size(keytree_t *tree) {
+  return tree ? tree->size : KEYTREE_INVAL;
+}

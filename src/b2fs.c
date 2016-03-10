@@ -2,13 +2,14 @@
 
 // Error codes.
 #define B2FS_SUCCESS 0x00
-#define B2FS_GENERIC_ERROR -0x01
-#define B2FS_INVAL -0x02
-#define B2FS_NOMEM -0x04
-#define B2FS_GENERIC_NETWORK_ERROR -0x08
+#define B2FS_ERROR -0x01
+#define B2FS_INVAL_ERROR -0x02
+#define B2FS_NOMEM_ERROR -0x04
+#define B2FS_NETWORK_ERROR -0x08
 #define B2FS_NETWORK_ACCESS_ERROR -0x0100
 #define B2FS_NETWORK_INTERN_ERROR -0x0101
 #define B2FS_NETWORK_API_ERROR -0x0102
+#define B2FS_NETWORK_TOKEN_ERROR -0x0104
 #define B2FS_FS_NOTDIR_ERROR -0x0200
 #define B2FS_FS_NOENT_ERROR -0x0201
 
@@ -39,6 +40,7 @@
 #include <string.h>
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
 
 /*----- Local Includes -----*/
 
@@ -54,33 +56,51 @@
 
 #ifdef DEBUG
 
-#define write_log(level, ...)                                                 \
-  do {                                                                        \
-    printf(__VA_ARGS__);                                                      \
+#define write_log(level, ...)                                                                             \
+  do {                                                                                                    \
+    printf(__VA_ARGS__);                                                                                  \
   } while (0);
 
 #elif INFO
 
-#define write_log(level, ...)                                                 \
-  do {                                                                        \
-    if (level == LEVEL_INFO) printf(__VA_ARGS__)                              \
-    else if (level == LEVEL_ERROR) fprintf(stderr, __VA_ARGS__);              \
+#define write_log(level, ...)                                                                             \
+  do {                                                                                                    \
+    if (level == LEVEL_INFO) printf(__VA_ARGS__)                                                          \
+    else if (level == LEVEL_ERROR) fprintf(stderr, __VA_ARGS__);                                          \
   } while (0);
 
 #else
 
-#define write_log(level, ...)                                                 \
-  do {                                                                        \
-    if (level == LEVEL_ERROR) fprintf(stderr, __VA_ARGS__);                   \
+#define write_log(level, ...)                                                                             \
+  do {                                                                                                    \
+    if (level == LEVEL_ERROR) fprintf(stderr, __VA_ARGS__);                                               \
   } while (0);
 
 #endif
 
-#define LOG_KEY(data, key, context)                                           \
-  do {                                                                        \
-    write_log(LEVEL_DEBUG, "B2FS: Encountered unexpected key in %s: %.*s\n",  \
-        context, key->end - key->start, data + key->start);                   \
+#define LOG_KEY(data, key, context)                                                                       \
+  do {                                                                                                    \
+    write_log(LEVEL_DEBUG, "B2FS: Encountered unexpected key in %s: %.*s\n",                              \
+        context, key->end - key->start, data + key->start);                                               \
   } while (0);
+
+// This macro makes me very sad, and goes against my better judgement, but cURL setup has just
+// become boilerplate at this point.
+// If cURL fails to initialize, this code will probably crash, but to be honest I'm not
+// entirely sure what the "correct" decision would be under that situation as it likely would
+// be indicative of a fatal error.
+#define INITIALIZE_LIBCURL(curl, base, uri, token, lock, header, write_var, write_func, post)             \
+  char urlbuf[B2FS_SMALL_GENERIC_BUFFER], auth[B2FS_SMALL_GENERIC_BUFFER], tok[B2FS_TOKEN_LEN];           \
+strcpy(tok, token);                                                                                     \
+sprintf(urlbuf, "%s/%s", base, uri);                                                                    \
+curl_easy_setopt(curl, CURLOPT_URL, urlbuf);                                                            \
+if (post) curl_easy_setopt(curl, CURLOPT_POST, 1L);                                                     \
+sprintf(auth, header, token);                                                                           \
+struct curl_slist *headers = NULL;                                                                      \
+headers = curl_slist_append(headers, auth);                                                             \
+curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);                                                    \
+curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_func);                                              \
+curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_var);
 
 /*----- Type Declarations -----*/
 
@@ -119,6 +139,7 @@ typedef struct b2fs_file_version {
   char version_id[B2FS_SMALL_GENERIC_BUFFER];
   char action[B2FS_MICRO_GENERIC_BUFFER];
   size_t size;
+  int *should_delete;
 } b2fs_file_version_t;
 
 typedef struct b2fs_file_chunk {
@@ -142,9 +163,11 @@ typedef struct b2fs_hash_entry {
 
 typedef struct b2fs_state {
   char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];
-  char down_url[B2FS_TOKEN_LEN], bucket[B2FS_SMALL_GENERIC_BUFFER];
+  char down_url[B2FS_TOKEN_LEN];
+  b2fs_config_t config;
   b2fs_delete_policy_t policy;
-  hash_t *fs_cache;
+  hash_t *fs_cache, *id_mappings;
+  pthread_rwlock_t lock;
 } b2fs_state_t;
 
 /*----- Local Function Declarations -----*/
@@ -179,11 +202,13 @@ int b2fs_access(const char *path, int mode);
 
 // Network Functions.
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
-int attempt_authentication(b2fs_config_t *config, b2fs_state_t *b2_info);
+int handle_b2_error(b2fs_state_t *state, char *response, char *cached_token);
+int handle_authentication(b2fs_state_t *state, char *account_id, char *app_key);
 
 // Struct Initializers.
 int init_file_entry(b2fs_file_entry_t *entry);
 void destroy_file_entry(void *voidarg);
+void destroy_file_version(void *voidarg);
 void destroy_hash_entry(void *voidarg);
 
 // Filesystem Helpers.
@@ -205,7 +230,7 @@ void print_usage(int intentional);
 /*----- Local Function Implementations -----*/
 
 int main(int argc, char **argv) {
-  int c, index, retval, config_requested = 0;
+  int c, index, retval;
   b2fs_config_t config;
   b2fs_state_t b2_info;
   char *config_file = "b2fs.yml", *mount_point = NULL;
@@ -270,7 +295,6 @@ int main(int argc, char **argv) {
         strcpy(config.bucket_id, optarg);
         break;
       case 'c':
-        config_requested = 1;
         config_file = optarg;
         break;
       case 'd':
@@ -323,7 +347,7 @@ int main(int argc, char **argv) {
 
   if (retval) {
     // Attempt to grab authentication token from B2.
-    retval = attempt_authentication(&config, &b2_info);
+    retval = handle_authentication(&b2_info, config.account_id, config.app_key);
 
     // Check response.
     switch (retval) {
@@ -337,11 +361,11 @@ int main(int argc, char **argv) {
         write_log(LEVEL_DEBUG, "B2FS: Internal error detected!!!! Failed to authenticate, reason: %s", b2_info.token);
         write_log(LEVEL_ERROR, "B2FS: Encountered an internal error while authenticating. Please try again.\n");
         break;
-      case B2FS_GENERIC_NETWORK_ERROR:
+      case B2FS_NETWORK_ERROR:
         write_log(LEVEL_DEBUG, "B2FS: cURL error encountered. Reason: %s\n", b2_info.token);
         write_log(LEVEL_ERROR, "B2FS: Network library error. Please try again.\n");
         break;
-      case B2FS_GENERIC_ERROR:
+      case B2FS_ERROR:
         write_log(LEVEL_ERROR, "B2FS: Failed to initialize network.\n");
     }
     if (retval != B2FS_SUCCESS) return EXIT_FAILURE;
@@ -350,8 +374,9 @@ int main(int argc, char **argv) {
     cache_auth(&b2_info);
   }
 
-  // We are authenticated and have a valid token. Start up FUSE.
-  strcpy(b2_info.bucket, config.bucket_id);
+  // We are authenticated and have a valid token. Finish state initialization.
+  b2_info.config = config;
+  pthread_rwlock_init(&b2_info.lock, NULL);
 
   // Get CLI arguments ready for FUSE.
   argv[1] = mount_point;
@@ -365,193 +390,227 @@ int main(int argc, char **argv) {
   return fuse_main(array_count(fuse_options) + 2, argv, &mappings, &b2_info);
 }
 
+// TODO: This function is crazy long and out of control. Refactoring won't help a whole lot,
+// because most of what it does is necessary, but I could break it out into constituent functions.
 void *b2fs_init(struct fuse_conn_info *info) {
   (void) info;
   b2fs_state_t *state = fuse_get_context()->private_data;
 
   // Initialize the filesystem cache.
   state->fs_cache = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
-  if (!state->fs_cache) {
+  state->id_mappings = create_hash(sizeof(char *), free);
+  if (!state->fs_cache || !state->id_mappings) {
     write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
-    hash_destroy(state->fs_cache);
+    if (state->fs_cache) hash_destroy(state->fs_cache);
+    if (state->id_mappings) hash_destroy(state->id_mappings);
     fuse_exit(fuse_get_context()->fuse);
   }
 
   // B2FS currently expects to have exclusive access to the bucket.
   // Go ahead and cache all filenames ahead of time to decrease latency on later
   // calls.
-  CURLcode res;
-  CURL *curl = curl_easy_init();
-  char urlbuf[B2FS_SMALL_GENERIC_BUFFER], start_filename[B2FS_SMALL_GENERIC_BUFFER];
-  char start_fileid[B2FS_SMALL_GENERIC_BUFFER], auth[B2FS_SMALL_GENERIC_BUFFER];
-  char body[B2FS_SMALL_GENERIC_BUFFER];
-  b2fs_string_t response;
-  memset(&response, 0, sizeof(b2fs_string_t));
+  // Do-While loop works as a conditional retry-loop if our auth token is expired.
+  int do_again;
+  do {
+    CURL *curl = curl_easy_init();
+    CURLcode res;
+    char start_fileid[B2FS_SMALL_GENERIC_BUFFER], start_filename[B2FS_SMALL_GENERIC_BUFFER];
+    char body[B2FS_SMALL_GENERIC_BUFFER];
+    b2fs_string_t response;
+    do_again = 0;
+    memset(&response, 0, sizeof(b2fs_string_t));
+    memset(start_fileid, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+    memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
 
-  // Generate and set url for request.
-  sprintf(urlbuf, "%s/%s", state->api_url, "b2api/v1/b2_list_file_versions");
-  memset(start_filename, 0, B2FS_SMALL_GENERIC_BUFFER);
-  memset(start_fileid, 0, B2FS_SMALL_GENERIC_BUFFER);
-  curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
-  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    // Big, dirty, macro to handle all of the boilerplate cURL initialization stuff.
+    // Acquire read-lock to ensure we're using the most recent auth tokens and everything.
+    pthread_rwlock_rdlock(&state->lock);
+    INITIALIZE_LIBCURL(
+        curl,
+        state->api_url,
+        "b2api/v1/b2_list_file_versions",
+        state->token,
+        state->lock,
+        "Authorization: %s",
+        response,
+        receive_string,
+        1);
+    pthread_rwlock_unlock(&state->lock);
 
-  // Set authorization header for request.
-  sprintf(auth, "Authorization: %s", state->token);
-  struct curl_slist *headers = NULL;
-  headers = curl_slist_append(headers, auth);
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    // Loop until all files have been loaded.
+    while (strcmp(start_filename, "null") && strcmp(start_fileid, "null")) {
+      // Set POST body.
+      if (strlen(start_filename) || strlen(start_fileid)) {
+        // Quick sanity checking.
+        assert(strlen(start_filename) && strlen(start_fileid));
 
-  // Setup data callbacks.
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_string);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        // I hate putting single calls on multiple lines, but this is otherwise too long.
+        sprintf(body,
+            "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"startFileId\":\"%s\",\"maxFileCount\":1000}",
+            state->config.bucket_id, start_filename, start_fileid);
+      } else {
+        sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":1000}", state->config.bucket_id);
+      }
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
-  // Loop until all files have been loaded.
-  while (strcmp(start_filename, "null") && strcmp(start_fileid, "null")) {
-    // Set POST body.
-    if (strlen(start_filename) || strlen(start_fileid)) {
-      // Quick sanity checking.
-      assert(strlen(start_filename) && strlen(start_fileid));
+      // Perform request.
+      if ((res = curl_easy_perform(curl)) == CURLE_OK) {
+        long code;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 
-      // I hate putting single calls on multiple lines, but this is otherwise too long.
-      sprintf(body,
-          "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"startFileId\":\"%s\",\"maxFileCount\":1000}",
-          state->bucket, start_filename, start_fileid);
-    } else {
-      sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":1000}", state->bucket);
-    }
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        if (code == 200) {
+          // Our request was accepted! Get ready to parse json response.
+          int token_count = JSMN_ERROR_NOMEM;
+          jsmn_parser parser;
+          jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * B2FS_MED_GENERIC_BUFFER);
 
-    // Perform request.
-    if ((res = curl_easy_perform(curl)) == CURLE_OK) {
-      long code;
-      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-
-      if (code == 200) {
-        // Our request was accepted! Get ready to parse json response.
-        int token_count = JSMN_ERROR_NOMEM;
-        jsmn_parser parser;
-        jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * B2FS_MED_GENERIC_BUFFER);
-
-        // Make sure enough memory is available, and parse response.
-        for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
-          memset(&parser, 0, sizeof(jsmn_parser));
-          token_count = jsmn_parse(&parser, response.str, strlen(response.str), tokens, B2FS_MED_GENERIC_BUFFER * i);
-          if (token_count == JSMN_ERROR_NOMEM) {
-            void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_MED_GENERIC_BUFFER * (i + 1)));
-            if (!tmp) {
-              write_log(LEVEL_DEBUG, "B2FS: Failed to allocate enough tokens for initial fs caching...\n");
-              write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
+          // Make sure enough memory is available, and parse response.
+          for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
+            jsmn_init(&parser);
+            token_count = jsmn_parse(&parser, response.str, strlen(response.str), tokens, B2FS_MED_GENERIC_BUFFER * i);
+            if (token_count == JSMN_ERROR_NOMEM) {
+              void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_MED_GENERIC_BUFFER * (i + 1)));
+              if (!tmp) {
+                write_log(LEVEL_DEBUG, "B2FS: Failed to allocate enough tokens for initial fs caching...\n");
+                write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
+                if (tokens) free(tokens);
+                hash_destroy(state->fs_cache);
+                hash_destroy(state->id_mappings);
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+                fuse_exit(fuse_get_context()->fuse);
+              }
+              tokens = tmp;
+            } else if (token_count == JSMN_ERROR_INVAL || token_count == JSMN_ERROR_PART) {
+              write_log(LEVEL_ERROR, "B2FS: B2 returned an invalid response during startup.\n");
               if (tokens) free(tokens);
               hash_destroy(state->fs_cache);
+              hash_destroy(state->id_mappings);
               curl_slist_free_all(headers);
               curl_easy_cleanup(curl);
               fuse_exit(fuse_get_context()->fuse);
             }
-            tokens = tmp;
-          } else if (token_count == JSMN_ERROR_INVAL || token_count == JSMN_ERROR_PART) {
-            write_log(LEVEL_ERROR, "B2FS: B2 returned an invalid response during startup.\n");
-            if (tokens) free(tokens);
+          }
+
+          // Zero start_filename and start_fileid to ensure null termination.
+          memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+          memset(start_fileid, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+          for (int i = 1; i < token_count; i++) {
+            jsmntok_t *key = &tokens[i++], *value = &tokens[i++];
+            int len = value->end - value->start, token_index = i;
+
+            if (jsmn_iskey(response.str, key, "files")) {
+              for (int j = 0; j < value->size; j++) {
+                jsmntok_t *file = &tokens[token_index++];
+                b2fs_hash_entry_t entry;
+                b2fs_file_version_t version;
+                char **path_pieces, filename[B2FS_MED_GENERIC_BUFFER], *id_mapping;
+                long size, timestamp;
+
+                // Parse out file path pieces and file size.
+                for (int k = 0; k < file->size; k++) {
+                  jsmntok_t *obj_key = &tokens[token_index++], *obj_value = &tokens[token_index++];
+                  int obj_len = obj_value->end - obj_value->start;
+
+                  if (jsmn_iskey(response.str, obj_key, "fileName")) {
+                    // Copy filename into local buffer to split into pieces.
+                    memset(filename, 0, sizeof(char) * B2FS_MED_GENERIC_BUFFER);
+                    memcpy(filename, response.str + obj_value->start, obj_len);
+
+                    // Allocate string for id->name mapping and copy over value (necessary because
+                    // splitting path uses strtok_r and is destructive).
+                    id_mapping = malloc(sizeof(char) * (obj_len + 1));
+                    strcpy(id_mapping, filename);
+
+                    // Split path.
+                    path_pieces = split_path(filename);
+                  } else if (jsmn_iskey(response.str, obj_key, "size")) {
+                    size = strtol(response.str + obj_value->start, NULL, 10);
+                  } else if (jsmn_iskey(response.str, obj_key, "uploadTimestamp")) {
+                    timestamp = strtol(response.str + obj_value->start, NULL, 10);
+                  } else if (jsmn_iskey(response.str, obj_key, "fileId")) {
+                    memset(version.version_id, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+                    memcpy(version.version_id, response.str + obj_value->start, obj_len);
+                  } else if (jsmn_iskey(response.str, obj_key, "action")) {
+                    memset(version.action, 0, sizeof(char) * B2FS_MICRO_GENERIC_BUFFER);
+                    memcpy(version.action, response.str + obj_value->start, obj_len);
+                  }
+                }
+
+                // Make all intermediate directories and grab parent.
+                hash_t *dir = make_path(path_pieces, state->fs_cache);
+
+                // Add id->name mapping.
+                hash_put(state->id_mappings, version.version_id, &id_mapping);
+
+                if (hash_get(dir, path_pieces[0], &entry) != HASH_SUCCESS) {
+                  // Hash entry does not exist. This is the first time we've seen this file.
+                  entry.type = TYPE_FILE;
+                  init_file_entry(&entry.file);
+                  hash_put(dir, path_pieces[0], &entry);
+                }
+                assert(strlen(version.action) > 0 && strlen(version.version_id) > 0);
+                version.size = size;
+                keytree_insert(entry.file.versions, &timestamp, &version);
+
+                // Clean up and prepare for next iteration.
+                free(path_pieces);
+              }
+
+              // Back up the token index for the outer loop.
+            } else if (jsmn_iskey(response.str, key, "nextFileName")) {
+              memcpy(start_filename, response.str + value->start, len);
+            } else if (jsmn_iskey(response.str, key, "nextFileId")) {
+              memcpy(start_fileid, response.str + value->start, len);
+            } else {
+              // We received an unknown key from B2. Log it, but try to keep going.
+              LOG_KEY(response.str, key, "b2fs_init");
+            }
+
+            // Prepare for next iteration.
+            i = --token_index;
+          }
+
+          // Clear the response string to prepare for the next iteration.
+          free(response.str);
+          memset(&response, 0, sizeof(b2fs_string_t));
+        } else {
+          // B2 returned an error.
+          write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %ld with message: %s\n", code, response.str);
+
+          // Attempt to handle the returned error.
+          int retval = handle_b2_error(state, response.str, tok);
+
+          // Check the reason the error was generated.
+          // TODO: Currently only one supported reason, so I may need to add more clauses here eventually.
+          if (retval == B2FS_NETWORK_TOKEN_ERROR) {
+            do_again = 1;
+            free(response.str);
+            memset(&response, 0, sizeof(b2fs_string_t));
+          } else {
+            // Error couldn't be handled. We're in the process of starting up, so just shutdown.
+            write_log(LEVEL_ERROR, "B2FS: B2 returned an unexpected error during startup. This is most likely a bug. Go make a report\n");
             hash_destroy(state->fs_cache);
+            hash_destroy(state->id_mappings);
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
+            free(response.str);
             fuse_exit(fuse_get_context()->fuse);
           }
         }
-
-        // Zero start_filename and start_fileid to ensure null termination.
-        memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-        memset(start_fileid, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-        for (int i = 1; i < token_count; i++) {
-          jsmntok_t *key = &tokens[i++], *value = &tokens[i++];
-          int len = value->end - value->start, token_index = i;
-
-          if (jsmn_iskey(response.str, key, "files")) {
-            for (int j = 0; j < value->size; j++) {
-              jsmntok_t *file = &tokens[token_index++];
-              b2fs_hash_entry_t entry;
-              b2fs_file_version_t version;
-              char **path_pieces, filename[B2FS_SMALL_GENERIC_BUFFER];
-              long size, timestamp;
-
-              // Parse out file path pieces and file size.
-              for (int k = 0; k < file->size; k++) {
-                jsmntok_t *obj_key = &tokens[token_index++], *obj_value = &tokens[token_index++];
-                int obj_len = obj_value->end - obj_value->start;
-
-                if (jsmn_iskey(response.str, obj_key, "fileName")) {
-                  memset(filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-                  memcpy(filename, response.str + obj_value->start, obj_len);
-                  path_pieces = split_path(filename);
-                } else if (jsmn_iskey(response.str, obj_key, "size")) {
-                  size = strtol(response.str + obj_value->start, NULL, 10);
-                } else if (jsmn_iskey(response.str, obj_key, "uploadTimestamp")) {
-                  timestamp = strtol(response.str + obj_value->start, NULL, 10);
-                } else if (jsmn_iskey(response.str, obj_key, "fileId")) {
-                  memset(version.version_id, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-                  memcpy(version.version_id, response.str + obj_value->start, obj_len);
-                } else if (jsmn_iskey(response.str, obj_key, "action")) {
-                  memset(version.action, 0, sizeof(char) * B2FS_MICRO_GENERIC_BUFFER);
-                  memcpy(version.action, response.str + obj_value->start, obj_len);
-                }
-              }
-
-              // Make all intermediate directories.
-              hash_t *dir = make_path(path_pieces, state->fs_cache);
-
-              if (hash_get(dir, path_pieces[0], &entry) != HASH_SUCCESS) {
-                // Hash entry does not exist. This is the first time we've seen this file.
-                entry.type = TYPE_FILE;
-                init_file_entry(&entry.file);
-                hash_put(dir, path_pieces[0], &entry);
-              }
-              assert(strlen(version.action) > 0 && strlen(version.version_id) > 0);
-              version.size = size;
-              keytree_insert(entry.file.versions, &timestamp, &version);
-
-              // Clean up and prepare for next iteration.
-              free(path_pieces);
-            }
-
-            // Back up the token index for the outer loop.
-          } else if (jsmn_iskey(response.str, key, "nextFileName")) {
-            memcpy(start_filename, response.str + value->start, len);
-          } else if (jsmn_iskey(response.str, key, "nextFileId")) {
-            memcpy(start_fileid, response.str + value->start, len);
-          } else {
-            // We received an unknown key from B2. Log it, but try to keep going.
-            LOG_KEY(response.str, key, "b2fs_init");
-          }
-
-          // Prepare for next iteration.
-          i = --token_index;
-        }
-
-        // Clear the response string to prepare for the next iteration.
-        free(response.str);
-        response.str = NULL;
-        response.ptr = 0;
       } else {
-        // TODO: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to add
-        // logic here to attempt a re-authentication.
-        write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %ld with message: %s\n", code, response.str);
-        write_log(LEVEL_ERROR, "B2FS: B2 returned an error during startup. This is most likely a bug. Go make a report.\n");
+        write_log(LEVEL_DEBUG, "B2FS: cURL failed with error %s during initial caching.\n", curl_easy_strerror(res));
+        write_log(LEVEL_ERROR, "B2FS: Failed to initialize network during startup. This is most likely a bug. Go make a report.\n");
         hash_destroy(state->fs_cache);
+        hash_destroy(state->id_mappings);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         fuse_exit(fuse_get_context()->fuse);
       }
-    } else {
-      write_log(LEVEL_DEBUG, "B2FS: cURL failed with error %s during initial caching.\n", curl_easy_strerror(res));
-      hash_destroy(state->fs_cache);
-      curl_slist_free_all(headers);
-      curl_easy_cleanup(curl);
-      fuse_exit(fuse_get_context()->fuse);
     }
-  }
-
-  // Cleanup cURL resources.
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+  } while (do_again);
 
   return state;
 }
@@ -561,7 +620,7 @@ void b2fs_destroy(void *userdata) {
   (void) userdata;
 }
 
-// TODO: Implement this function.
+// Function returns basic information for a given file path.
 int b2fs_getattr(const char *path, struct stat *statbuf) {
   b2fs_state_t *state = fuse_get_context()->private_data;
 
@@ -735,9 +794,143 @@ int b2fs_symlink(const char *from, const char *to) {
   return -ENOTSUP;
 }
 
-// TODO: Implement this function.
+// Function takes care of deleting a file. Performs (perhaps unnecessary) validation to make sure
+// the path isn't a directory, then removes the file from the local cache based on the deletion
+// policy. File is removed from B2 in the file version destructor.
 int b2fs_unlink(const char *path) {
-  return -ENOTSUP;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  // Locate the file to make sure it exists.
+  if (strcmp(path, "/")) {
+    // Find requested directory.
+    b2fs_hash_entry_t entry;
+    char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
+    strcpy(path_copy, path);
+    int retval = find_path(path_copy, state->fs_cache, &entry);
+    free(path_copy);
+
+    if (retval == B2FS_SUCCESS) {
+      // File exists. Time to do the hard work.
+      if (state->policy != POLICY_HIDE) {
+        // Figure out how many files we need to delete.
+        int num_iterations = state->policy == POLICY_DELETE_ONE ? 1 : keytree_size(entry.file.versions);
+
+        // Iterate over versions and mark for deletion.
+        size_t key;
+        b2fs_file_version_t version;
+        stack_t *deletions = create_stack(NULL, sizeof(size_t));
+        keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
+        while (num_iterations-- && keytree_iterate_next(it, &key, &version) == KEYTREE_SUCCESS) {
+          *version.should_delete = 1;
+          stack_push(deletions, &key);
+        }
+        keytree_iterate_stop(it);
+
+        // Remove versions from the version tree (will call destructor to delete from B2).
+        while (stack_pop(deletions, &key) == STACK_SUCCESS) keytree_remove(entry.file.versions, &key, NULL);
+        destroy_stack(deletions);
+      }
+
+      // Hide the earliest remaining file if there is one.
+      if (keytree_size(entry.file.versions) > 0) {
+        // Do-while loop works as a conditional retry-loop if our auth token is expired.
+        int do_again;
+        do {
+          CURL *curl = curl_easy_init();
+          CURLcode res;
+          char body[B2FS_SMALL_GENERIC_BUFFER], *filename;
+          b2fs_string_t response;
+          do_again = 0;
+          memset(&response, 0, sizeof(b2fs_string_t));
+
+          // Big, dirty, macro to handle all of the boilerplate cURL initialization stuff.
+          // Acquire read-lock to make sure we're using the right auth token and stuff.
+          pthread_rwlock_rdlock(&state->lock);
+          INITIALIZE_LIBCURL(
+              curl,
+              state->api_url,
+              "b2api/v1/b2_hide_file",
+              state->token,
+              state->lock,
+              "Authorization: %s",
+              response,
+              receive_string,
+              1);
+          pthread_rwlock_unlock(&state->lock);
+
+          // Get the most recent remaining version.
+          b2fs_file_version_t version;
+          keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
+          assert(keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS);
+          keytree_iterate_stop(it);
+
+          // Get the name of the file exactly as B2 expects it and create the request body.
+          assert(hash_get(state->id_mappings, version.version_id, &filename) == HASH_SUCCESS);
+          sprintf(body, "{\"bucketId\":\"%s\",\"fileName\":\"%s\"}", state->config.bucket_id, filename);
+
+          // Perform the request.
+          if ((res = curl_easy_perform(curl)) == CURLE_OK) {
+            long code;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+            if (code == 200) {
+              // No need to check response. Hide API just returns info on the file that we already have, and the API docs state that
+              // a 200 is sufficient to know that the file has been hidden.
+              free(response.str);
+            } else {
+              // FIXME: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to
+              // add logic here to attempt a re-authentication.
+              write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %ld with message: %s\n", code, response.str);
+
+              // Attempt to handle the returned error.
+              int retval = handle_b2_error(state, response.str, tok);
+
+              // Regardless of what happens, this stuff needs to be cleaned up.
+              free(response.str);
+              memset(&response, 0, sizeof(b2fs_string_t));
+
+              // Check the reason the error was generated, and if it was handled.
+              // TODO: Currently only one supported reason, so I may need to add more clauses here eventually.
+              if (retval == B2FS_NETWORK_TOKEN_ERROR) {
+                // Do the request again.
+                do_again = 1;
+              } else {
+                // The error wasn't handled, and we don't know what went wrong. Return a generic IO error.
+                curl_slist_free_all(headers);
+                curl_easy_cleanup(curl);
+                return -EIO;
+              }
+            }
+          } else {
+            // FIXME: At the moment, this currently just reports a generic IO error if cURL fails to perform the request.
+            // Perhaps add more detailed error handling here eventually.
+            write_log(LEVEL_DEBUG, "B2FS: cURL returned error code %s while hiding the file %s.\n", curl_easy_strerror(res), filename);
+            return -EIO;
+          }
+
+          // Clean up cURL resources.
+          curl_slist_free_all(headers);
+          curl_easy_cleanup(curl);
+        } while (do_again);
+
+        // Lots of ways to get here, time to return.
+        return B2FS_SUCCESS;
+      } else {
+        return B2FS_SUCCESS;
+      }
+    } else if (retval == B2FS_FS_NOENT_ERROR) {
+      // File doesn't exist.
+      return -ENOENT;
+    } else {
+      // An intermediate path entry isn't a directory.
+      return -ENOTDIR;
+    }
+  } else {
+    // User is asking for us to unlink the root directory.
+    // This call is only supposed to be used for files. Don't know if this
+    // would ever actually happen.
+    return -EISDIR;
+  }
 }
 
 // TODO: Implement this function.
@@ -856,130 +1049,282 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
   return size * nmembers;
 }
 
-int attempt_authentication(b2fs_config_t *config, b2fs_state_t *b2_info) {
-  CURL *curl;
-  CURLcode res;
+// As the name suggests, this function is responsible for attempting to fix an error returned
+// from B2. Currently only supports re-authentication.
+// Contrary to the semantics of the other functions, this function actually returns the type of
+// error that occured on success, and a generic network error on failure.
+int handle_b2_error(b2fs_state_t *state, char *response, char *cached_token) {
+  // Need to figure out what went wrong. Time to parse JSON.
+  int token_count = JSMN_ERROR_NOMEM;
+  jsmn_parser parser;
+  jsmntok_t *tokens = malloc(sizeof(jsmntok_t) * B2FS_SMALL_GENERIC_BUFFER);
 
-  curl = curl_easy_init();
-  if (curl) {
-    char *url = "https://api.backblaze.com/b2api/v1/b2_authorize_account";
-    char conversionbuf[B2FS_SMALL_GENERIC_BUFFER], based[B2FS_SMALL_GENERIC_BUFFER], final[B2FS_SMALL_GENERIC_BUFFER];
-    char *tmp = based;
-    b2fs_string_t data;
-    memset(&data, 0, sizeof(b2fs_string_t));
-
-    // Set URL for request.
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-
-    // Create token to send for authentication.
-    base64_encodestate state;
-    base64_init_encodestate(&state);
-    sprintf(conversionbuf, "%s:%s", config->account_id, config->app_key);
-    tmp += base64_encode_block(conversionbuf, strlen(conversionbuf), tmp, &state);
-    tmp += base64_encode_blockend(tmp, &state);
-    *(--tmp) = '\0';
-    sprintf(final, "Authorization: Basic %s", based);
-
-    // Setup custom headers.
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, final);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    // Setup data callback.
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_string);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data);
-
-    // Attempt authentication.
-    if ((res = curl_easy_perform(curl)) == CURLE_OK) {
-      // No cURL errors occured, time to check for HTTP errors...
-      long code;
-      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-      curl_easy_cleanup(curl);
-
-      if (code == 200) {
-        int token_count = 0;
-        jsmn_parser parser;
-        jsmntok_t tokens[B2FS_SMALL_GENERIC_BUFFER];
-
-        // Our authentication request went through. Time to JSON parse.
-        jsmn_init(&parser);
-        token_count = jsmn_parse(&parser, data.str, strlen(data.str), tokens, B2FS_SMALL_GENERIC_BUFFER);
-        if (token_count == JSMN_ERROR_NOMEM || tokens[0].type != JSMN_OBJECT) {
-          free(data.str);
-          return B2FS_NETWORK_API_ERROR;
-        }
-
-        // Iterate over returned tokens and extract the needed info.
-        memset(b2_info, 0, sizeof(b2fs_state_t));
-        for (int i = 1; i < token_count; i++) {
-          jsmntok_t *key = &tokens[i++], *value = &tokens[i];
-          int len = value->end - value->start;
-
-          if (jsmn_iskey(data.str, key, "authorizationToken")) {
-            memcpy(b2_info->token, data.str + value->start, len);
-          } else if (jsmn_iskey(data.str, key, "apiUrl")) {
-            memcpy(b2_info->api_url, data.str + value->start, len);
-          } else if (jsmn_iskey(data.str, key, "downloadUrl")) {
-            memcpy(b2_info->down_url, data.str + value->start, len);
-          } else if (!jsmn_iskey(data.str, key, "accountId")) {
-            LOG_KEY(data.str, key, "authentication");
-          }
-        }
-        free(data.str);
-
-        // Validate and return!
-        if (strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url)) {
-          return B2FS_SUCCESS;
-        } else {
-          return B2FS_NETWORK_API_ERROR;
-        }
-      } else if (code == 401) {
-        // Our authentication request was rejected due to bad auth info.
-        free(data.str);
-        return B2FS_NETWORK_ACCESS_ERROR;
-      } else {
-        // Request was badly formatted. Denotes an internal error.
-        strncpy(b2_info->token, data.str, B2FS_TOKEN_LEN - 1);
-        b2_info->token[B2FS_TOKEN_LEN - 1] = '\0';
-        free(data.str);
-        return B2FS_NETWORK_INTERN_ERROR;
+  // Make sure enough memory is available and parse response.
+  for (int i = 1; token_count == JSMN_ERROR_NOMEM; i++) {
+    jsmn_init(&parser);
+    token_count = jsmn_parse(&parser, response, strlen(response), tokens, B2FS_SMALL_GENERIC_BUFFER * i);
+    if (token_count == JSMN_ERROR_NOMEM) {
+      void *tmp = realloc(tokens, sizeof(jsmntok_t) * (B2FS_SMALL_GENERIC_BUFFER * (i + 1)));
+      if (!tmp) {
+        write_log(LEVEL_DEBUG, "B2FS: Failed to allocate enough memory to parse B2 error message...\n");
+        free(tokens);
+        return B2FS_NOMEM_ERROR;
       }
-      return B2FS_SUCCESS;
-    } else {
-      // cURL error encountered. Don't know enough about this to predict why.
-      // FIXME: Maybe add more detailed error handling here.
-      strncpy(b2_info->token, curl_easy_strerror(res), B2FS_TOKEN_LEN - 1);
-      b2_info->token[B2FS_TOKEN_LEN - 1] = '\0';
-      curl_easy_cleanup(curl);
-      return B2FS_GENERIC_NETWORK_ERROR;
+      tokens = tmp;
+    } else if (token_count == JSMN_ERROR_INVAL || token_count == JSMN_ERROR_PART) {
+      write_log(LEVEL_DEBUG, "B2FS: B2 returned an invalid error message.\n");
+      free(tokens);
+      return B2FS_INVAL_ERROR;
     }
-  } else {
+  }
+
+  for (int i = 1; i < token_count; i++) {
+    jsmntok_t *key = &tokens[i++], *value = &tokens[i];
+    int len = value->end - value->start;
+
+    if (jsmn_iskey(response, key, "code")) {
+      char reason[B2FS_SMALL_GENERIC_BUFFER];
+      memset(reason, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
+      memcpy(reason, response + value->start, len);
+      free(tokens);
+
+      // TODO: The ultimate point to this function is to be able to handle many different potential error conditions from
+      // B2, so I'll need to add more clauses here.
+      if (!strcmp(reason, "expired_auth_token")) {
+        // We received an error from B2 because our authentication token has expired. Acquire the write-lock to ensure nobody
+        // tries using the tokens while we're updating them.
+        pthread_rwlock_wrlock(&state->lock);
+
+        // Now that we hold the write-lock, double check that the expired token that we used is still the one in the state
+        // struct. If so, update it, if not, somebody else got here first.
+        if (!strcmp(state->token, cached_token)) {
+          int retval = handle_authentication(state, state->config.account_id, state->config.app_key);
+          cache_auth(state);
+          pthread_rwlock_unlock(&state->lock);
+          return retval == B2FS_SUCCESS ? B2FS_NETWORK_TOKEN_ERROR : B2FS_NETWORK_ERROR;
+        } else {
+          pthread_rwlock_unlock(&state->lock);
+          return B2FS_NETWORK_TOKEN_ERROR;
+        }
+      } else {
+        return B2FS_NETWORK_ERROR;
+      }
+    }
+  }
+
+  // We shouldn't be able to get here if B2 returns a JSON object that fits the API docs, but the compiler doesn't
+  // know that.
+  return B2FS_NETWORK_ERROR;
+}
+
+int handle_authentication(b2fs_state_t *state, char *account_id, char *app_key) {
+  CURL *curl = curl_easy_init();
+  CURLcode res;
+  char buf[B2FS_SMALL_GENERIC_BUFFER], based[B2FS_SMALL_GENERIC_BUFFER], final[B2FS_SMALL_GENERIC_BUFFER], *tmp = based;
+  b2fs_string_t data;
+  memset(&data, 0, sizeof(b2fs_string_t));
+
+  // Create token to send for authentication.
+  base64_encodestate encoder;
+  base64_init_encodestate(&encoder);
+  sprintf(buf, "%s:%s", account_id, app_key);
+  tmp += base64_encode_block(buf, strlen(buf), tmp, &encoder);
+  tmp += base64_encode_blockend(tmp, &encoder);
+  *(--tmp) = '\0';
+  sprintf(final, "Authorization: Basic %s", based);
+
+  // Big, dirty, macro to handle all of the boilerplate cURL initialization stuff.
+  // Note that we do not acquire the read-lock here, because this function will always either be
+  // called with the write-lock held, or in a context where contention is impossible.
+  INITIALIZE_LIBCURL(
+      curl,
+      "https://api.backblaze.com",
+      "b2api/v1/b2_authorize_account",
+      based,
+      state->lock,
+      "Authorization: Basic %s",
+      data,
+      receive_string,
+      0);
+
+  // Attempt authentication.
+  if ((res = curl_easy_perform(curl)) == CURLE_OK) {
+    // No cURL errors occured, time to check for HTTP errors...
+    long code;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     curl_easy_cleanup(curl);
-    return B2FS_GENERIC_ERROR;
+
+    if (code == 200) {
+      int token_count = 0;
+      jsmn_parser parser;
+      jsmntok_t tokens[B2FS_SMALL_GENERIC_BUFFER];
+
+      // Our authentication request went through. Time to JSON parse.
+      jsmn_init(&parser);
+      token_count = jsmn_parse(&parser, data.str, strlen(data.str), tokens, B2FS_SMALL_GENERIC_BUFFER);
+      if (token_count == JSMN_ERROR_NOMEM || tokens[0].type != JSMN_OBJECT) {
+        free(data.str);
+        return B2FS_NETWORK_API_ERROR;
+      }
+
+      // Iterate over returned tokens and extract the needed info.
+      memset(state, 0, sizeof(b2fs_state_t));
+      for (int i = 1; i < token_count; i++) {
+        jsmntok_t *key = &tokens[i++], *value = &tokens[i];
+        int len = value->end - value->start;
+
+        if (jsmn_iskey(data.str, key, "authorizationToken")) {
+          memcpy(state->token, data.str + value->start, len);
+        } else if (jsmn_iskey(data.str, key, "apiUrl")) {
+          memcpy(state->api_url, data.str + value->start, len);
+        } else if (jsmn_iskey(data.str, key, "downloadUrl")) {
+          memcpy(state->down_url, data.str + value->start, len);
+        } else if (!jsmn_iskey(data.str, key, "accountId")) {
+          LOG_KEY(data.str, key, "authentication");
+        }
+      }
+      free(data.str);
+
+      // Validate and return!
+      if (strlen(state->token) && strlen(state->api_url) && strlen(state->down_url)) {
+        return B2FS_SUCCESS;
+      } else {
+        return B2FS_NETWORK_API_ERROR;
+      }
+    } else if (code == 401) {
+      // Our authentication request was rejected due to bad auth info.
+      free(data.str);
+      return B2FS_NETWORK_ACCESS_ERROR;
+    } else {
+      // Request was badly formatted. Denotes an internal error.
+      strncpy(state->token, data.str, B2FS_TOKEN_LEN - 1);
+      state->token[B2FS_TOKEN_LEN - 1] = '\0';
+      free(data.str);
+      return B2FS_NETWORK_INTERN_ERROR;
+    }
+    return B2FS_SUCCESS;
+  } else {
+    // cURL error encountered. Don't know enough about this to predict why.
+    // FIXME: Maybe add more detailed error handling here.
+    strncpy(state->token, curl_easy_strerror(res), B2FS_TOKEN_LEN - 1);
+    state->token[B2FS_TOKEN_LEN - 1] = '\0';
+    curl_easy_cleanup(curl);
+    return B2FS_NETWORK_ERROR;
   }
 }
 
 int init_file_entry(b2fs_file_entry_t *entry) {
-  if (!entry) return B2FS_INVAL;
+  if (!entry) return B2FS_INVAL_ERROR;
 
   memset(entry, 0, sizeof(b2fs_file_entry_t));
   entry->chunkmap = create_bitmap();
-  entry->chunks = create_keytree(free, free, intcmp, sizeof(int), sizeof(b2fs_file_chunk_t));
-  entry->versions = create_keytree(free, free, rev_intcmp, sizeof(size_t), sizeof(b2fs_file_version_t));
+  entry->chunks = create_keytree(NULL, NULL, intcmp, sizeof(int), sizeof(b2fs_file_chunk_t));
+  entry->versions = create_keytree(NULL, destroy_file_version, rev_intcmp, sizeof(size_t), sizeof(b2fs_file_version_t));
   if (!entry->chunkmap || !entry->chunks) {
     if (entry->chunkmap) free(entry->chunkmap);
     if (entry->chunks) free(entry->chunks);
-    return B2FS_NOMEM;
+    return B2FS_NOMEM_ERROR;
   }
 
   return B2FS_SUCCESS;
 }
 
+int init_file_version(b2fs_file_version_t *version) {
+  if (!version) return B2FS_INVAL_ERROR;
+
+  memset(version, 0, sizeof(b2fs_file_version_t));
+  version->should_delete = malloc(sizeof(int));
+  if (version->should_delete) return B2FS_SUCCESS;
+  else return B2FS_NOMEM_ERROR;
+}
+
 void destroy_file_entry(void *voidarg) {
   b2fs_file_entry_t *entry = voidarg;
   keytree_destroy(entry->chunks);
+  keytree_destroy(entry->versions);
   destroy_bitmap(entry->chunkmap);
   free(entry);
+}
+
+void destroy_file_version(void *voidarg) {
+  b2fs_state_t *state = fuse_get_context()->private_data;
+  b2fs_file_version_t *version = voidarg;
+
+  if (version->should_delete) {
+    // Do-While loop works as a conditional retry-loop if our auth token is expired.
+    int do_again;
+    do {
+      CURL *curl = curl_easy_init();
+      CURLcode res;
+      char body[B2FS_SMALL_GENERIC_BUFFER];
+      b2fs_string_t response;
+      do_again = 0;
+      memset(&response, 0, sizeof(b2fs_string_t));
+
+      // Big, dirty, macro to handle all of the boilerplate cURL initialization stuff.
+      // Acquire the read-lock to make sure we're using the right auth token and stuff.
+      pthread_rwlock_rdlock(&state->lock);
+      INITIALIZE_LIBCURL(
+          curl,
+          state->api_url,
+          "b2api/b1/b2_delete_file_version",
+          state->token,
+          state->lock,
+          "Authorization: %s",
+          response,
+          receive_string,
+          1);
+      pthread_rwlock_unlock(&state->lock);
+
+      // Get file name.
+      char *filename;
+      assert(hash_get(state->id_mappings, version->version_id, &filename) == HASH_SUCCESS);
+      hash_drop(state->id_mappings, version->version_id);
+
+      // Set POST body.
+      sprintf(body, "{\"fileName\":\"%s\",\"fileId\":\"%s\"}", filename, version->version_id);
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+
+      // Perform the request.
+      if ((res = curl_easy_perform(curl)) == CURLE_OK) {
+        long code;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+        if (code == 200) {
+          // No need to check response. Delete API just returns the sent data, and the API docs state that a 200 is sufficient
+          // to know the file has been deleted.
+          free(response.str);
+        } else {
+          // B2 returned an error.
+          write_log(LEVEL_DEBUG, "B2FS: B2 returned an error code %ld with message: %s\n", code, response.str);
+
+          // Attempt to handle the returned error.
+          int retval = handle_b2_error(state, response.str, tok);
+
+          // Clean up resources.
+          free(response.str);
+          memset(&response, 0, sizeof(b2fs_string_t));
+
+          // Take necessary action based on error handling results.
+          if (retval == B2FS_NETWORK_TOKEN_ERROR) do_again = 1;
+          else write_log(LEVEL_DEBUG, "B2FS: B2 error went unhandled during version destructor.\n");
+        }
+      } else {
+        // FIXME: This performs no error handling at the moment. Revisit this to decide what to do here.
+        // Hate putting calls on multiple lines, but this is too long.
+        write_log(LEVEL_DEBUG,
+            "B2FS: cURL failed with error %s during destruction of file %s.\n",
+            curl_easy_strerror(res), filename);
+        write_log(LEVEL_ERROR, "B2FS: An unexpected network error was encountered during the deletion of file %s.\n", filename);
+      }
+
+      // We either succeeded or failed. Cleanup and return.
+      curl_slist_free_all(headers);
+      curl_easy_cleanup(curl);
+    } while (do_again);
+  }
+
+  free(version->should_delete);
 }
 
 void destroy_hash_entry(void *voidarg) {
@@ -1143,7 +1488,7 @@ int find_cached_auth(b2fs_state_t *b2_info) {
 
   // Locate system tmpdir if possible.
   find_tmpdir(&tmpdir);
-  if (!tmpdir) return B2FS_GENERIC_ERROR;
+  if (!tmpdir) return B2FS_ERROR;
 
   // Open cache file.
   sprintf(path, "%s/b2fs_cache.txt", tmpdir);
@@ -1154,9 +1499,9 @@ int find_cached_auth(b2fs_state_t *b2_info) {
     int success;
     fscanf(cache_in, "%s\n%s\n%s", b2_info->token, b2_info->api_url, b2_info->down_url);
     success = strlen(b2_info->token) && strlen(b2_info->api_url) && strlen(b2_info->down_url);
-    return success ? B2FS_SUCCESS : B2FS_GENERIC_ERROR;
+    return success ? B2FS_SUCCESS : B2FS_ERROR;
   } else {
-    return B2FS_GENERIC_ERROR;
+    return B2FS_ERROR;
   }
 }
 
@@ -1181,14 +1526,14 @@ int parse_config(b2fs_config_t *config, char *config_filename) {
         if (!strcmp(valbuf, "hide")) config->policy = POLICY_HIDE;
         else if (!strcmp(valbuf, "delete")) config->policy = POLICY_DELETE_ONE;
         else if (!strcmp(valbuf, "delete_all")) config->policy = POLICY_DELETE_ALL;
-        else return B2FS_GENERIC_ERROR;
+        else return B2FS_ERROR;
       } else {
-        return B2FS_GENERIC_ERROR;
+        return B2FS_ERROR;
       }
     }
     return B2FS_SUCCESS;
   } else {
-    return B2FS_GENERIC_ERROR;
+    return B2FS_ERROR;
   }
 }
 

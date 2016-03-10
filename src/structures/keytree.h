@@ -31,4 +31,7 @@ int keytree_iterate_next(keytree_iterator_t *it, void *keybuf, void *valbuf);
 int keytree_iterate_prev(keytree_iterator_t *it, void *keybuf, void *valbuf);
 void keytree_iterate_stop(keytree_iterator_t *it);
 
+// KeyTree helper functions.
+int keytree_size(keytree_t *tree);
+
 #endif
