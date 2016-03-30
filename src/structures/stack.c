@@ -10,10 +10,16 @@ struct stack {
   list_t *lst;
 };
 
+/*----- Function Implementations -----*/
+
 stack_t *create_stack(void (*destruct) (void *), int elem_len) {
   stack_t *stack = malloc(sizeof(stack_t));
 
    if (stack) stack->lst = create_list(elem_len, destruct);
+   if (!stack->lst) {
+     free(stack);
+     stack = NULL;
+   }
 
    return stack;
 }
@@ -30,7 +36,7 @@ int stack_pop(stack_t *stack, void *buf) {
 }
 
 int stack_peek(stack_t *stack, void *buf) {
-  if (!stack) return STACK_INVAL;
+  if (!stack || !buf) return STACK_INVAL;
   if (lhead(stack->lst, buf) == LIST_EMPTY) return STACK_EMPTY;
   else return STACK_SUCCESS;
 }

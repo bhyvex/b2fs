@@ -50,9 +50,15 @@
 #include "structures/array.h"
 #include "structures/bitmap.h"
 #include "structures/stack.h"
+#include "structures/queue.h"
 #include "structures/keytree.h"
 
 /*----- Macro Declarations -----*/
+
+// Fun little hack for calculating the sizes of struct fields.
+// Second macro follows through to the type being pointed at.
+#define MEMBER_SIZE(type, member) sizeof(((type *) 0)->member)
+#define MEMBER_PTR_SIZE(type, member) sizeof(*((type *) 0)->member)
 
 #ifdef DEBUG
 
@@ -91,16 +97,16 @@
 // be indicative of a fatal error.
 #define INITIALIZE_LIBCURL(curl, base, uri, token, lock, header, write_var, write_func, post)             \
   char urlbuf[B2FS_SMALL_GENERIC_BUFFER], auth[B2FS_SMALL_GENERIC_BUFFER], tok[B2FS_TOKEN_LEN];           \
-strcpy(tok, token);                                                                                     \
-sprintf(urlbuf, "%s/%s", base, uri);                                                                    \
-curl_easy_setopt(curl, CURLOPT_URL, urlbuf);                                                            \
-if (post) curl_easy_setopt(curl, CURLOPT_POST, 1L);                                                     \
-sprintf(auth, header, token);                                                                           \
-struct curl_slist *headers = NULL;                                                                      \
-headers = curl_slist_append(headers, auth);                                                             \
-curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);                                                    \
-curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_func);                                              \
-curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_var);
+  strcpy(tok, token);                                                                                     \
+  sprintf(urlbuf, "%s/%s", base, uri);                                                                    \
+  curl_easy_setopt(curl, CURLOPT_URL, urlbuf);                                                            \
+  if (post) curl_easy_setopt(curl, CURLOPT_POST, 1L);                                                     \
+  sprintf(auth, header, token);                                                                           \
+  struct curl_slist *headers = NULL;                                                                      \
+  headers = curl_slist_append(headers, auth);                                                             \
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);                                                    \
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_func);                                              \
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_var);
 
 /*----- Type Declarations -----*/
 
@@ -138,7 +144,7 @@ typedef struct b2fs_config {
 typedef struct b2fs_file_version {
   char version_id[B2FS_SMALL_GENERIC_BUFFER];
   size_t size;
-  int *should_delete, *hidden;
+  int *should_delete, *hidden, *live, *synced;
 } b2fs_file_version_t;
 
 typedef struct b2fs_file_chunk {
@@ -146,19 +152,33 @@ typedef struct b2fs_file_chunk {
   char data[B2FS_CHUNK_SIZE];
 } b2fs_file_chunk_t;
 
+// FIXME: File versions currently uses a keytree where a stack or queue would most
+// likely be more appropriate because I'm not sure I trust B2 to return file versions
+// in proper reverse-upload order. Or, rather, I don't want my code to crash if they
+// change this, and keytree will enforce its own internal ordering.
 typedef struct b2fs_file_entry {
   bitmap_t *chunkmap;
   keytree_t *chunks, *versions;
   int readers, writers;
 } b2fs_file_entry_t;
 
+typedef struct b2fs_dir_entry {
+  hash_t *directory;
+  int *hidden;
+} b2fs_dir_entry_t;
+
 typedef struct b2fs_hash_entry {
   b2fs_entry_type_t type;
   union {
     b2fs_file_entry_t file;
-    hash_t *directory;
+    b2fs_dir_entry_t dir;
   };
 } b2fs_hash_entry_t;
+
+typedef struct b2fs_version_sync_state {
+  size_t timestamp;
+  int pos;
+} b2fs_version_sync_state_t;
 
 typedef struct b2fs_state {
   char token[B2FS_TOKEN_LEN], api_url[B2FS_TOKEN_LEN];
@@ -200,20 +220,22 @@ int b2fs_access(const char *path, int mode);
 
 // Network Functions.
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
+int b2_sync_versions(b2fs_file_entry_t *entry);
 int handle_b2_error(b2fs_state_t *state, char *response, char *cached_token);
 int handle_authentication(b2fs_state_t *state, char *account_id, char *app_key);
 
 // Struct Initializers.
 int init_file_entry(b2fs_file_entry_t *entry);
 int init_file_version(b2fs_file_version_t *version);
+int init_dir_entry(b2fs_dir_entry_t *entry);
 void destroy_file_entry(void *voidarg);
 void destroy_file_version(void *voidarg);
 void destroy_hash_entry(void *voidarg);
 
 // Filesystem Helpers.
 char **split_path(char *path);
-hash_t *make_path(char **path_pieces, hash_t *base);
-int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf);
+hash_t *make_path(char **path_pieces, hash_t *base, b2fs_dir_entry_t *output);
+int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf, int honor_hidden);
 int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type);
 
 // Generic Helper Functions.
@@ -391,6 +413,8 @@ int main(int argc, char **argv) {
 
 // TODO: This function is crazy long and out of control. Refactoring won't help a whole lot,
 // because most of what it does is necessary, but I could break it out into constituent functions.
+// TODO: Need to move the functionality from this function into a separate, 
+// list_file_versions, function, because it needs to be used by b2_sync_versions.
 void *b2fs_init(struct fuse_conn_info *info) {
   (void) info;
   b2fs_state_t *state = fuse_get_context()->private_data;
@@ -542,7 +566,8 @@ void *b2fs_init(struct fuse_conn_info *info) {
                 }
 
                 // Make all intermediate directories and grab parent.
-                hash_t *dir = make_path(path_pieces, state->fs_cache);
+                b2fs_dir_entry_t directory;
+                hash_t *dir = make_path(path_pieces, state->fs_cache, &directory);
 
                 // Add id->name mapping.
                 hash_put(state->id_mappings, version.version_id, &id_mapping);
@@ -555,7 +580,17 @@ void *b2fs_init(struct fuse_conn_info *info) {
                 }
                 assert(strlen(version.version_id) > 0);
                 version.size = size;
+                *version.live = 1;
+                *version.synced = 1;
                 keytree_insert(entry.file.versions, &timestamp, &version);
+
+                // Highly inelegant way of persisting directory deletions across restarts when B2FS is
+                // configured to only hide deleted files. B2 doesn't support hiding directories, so there's
+                // no way to disambiguate between a directory that exists, but has had all of its contents
+                // hidden, and a directory that has been explicitly deleted. Thus, in the latter case, we
+                // insert a .b2fs_hidefile entry to assert that the directory should, in fact, be hidden.
+                // Pretty not great, but it works.
+                if (!strcmp(path_pieces[0], ".b2fs_hidefile")) *directory.hidden = 1;
 
                 // Clean up and prepare for next iteration.
                 free(path_pieces);
@@ -635,7 +670,7 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
   if (strcmp(path, "/")) {
     char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
     strcpy(path_copy, path);
-    retval = find_path(path_copy, state->fs_cache, &entry);
+    retval = find_path(path_copy, state->fs_cache, &entry, 1);
     free(path_copy);
   } else {
     entry.type = TYPE_DIRECTORY;
@@ -644,12 +679,16 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
 
   // Check if entry was found.
   if (retval == B2FS_SUCCESS) {
+    // Check to make sure the file hasn't been hidden.
+    // No need to check for directories as find_path will return failure if
+    // directory is hidden.
+    size_t timestamp;
     if (entry.type == TYPE_FILE) {
       b2fs_file_version_t version;
 
       // Get most recent version of file.
       keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
-      assert(keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS);
+      assert(keytree_iterate_next(it, &timestamp, &version) == KEYTREE_SUCCESS);
       keytree_iterate_stop(it);
 
       // Only provide attributes for the file if it's not hidden.
@@ -669,14 +708,6 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
     // Set owner details.
     statbuf->st_uid = ROOT_UID;
     statbuf->st_gid = ROOT_GID;
-
-    // Get info for most recent file version.
-    size_t timestamp;
-    if (entry.type == TYPE_FILE) {
-      keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
-      keytree_iterate_next(it, &timestamp, &version);
-      keytree_iterate_stop(it);
-    }
 
     // Set other unsupported fields to sane defaults.
     statbuf->st_nlink = 1;
@@ -723,7 +754,7 @@ int b2fs_opendir(const char *path, struct fuse_file_info *info) {
     b2fs_hash_entry_t entry;
     char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
     strcpy(path_copy, path);
-    int retval = find_path(path_copy, state->fs_cache, &entry);
+    int retval = find_path(path_copy, state->fs_cache, &entry, 1);
     free(path_copy);
 
     // Perform validation and return.
@@ -745,7 +776,7 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
     b2fs_hash_entry_t entry;
     char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
     strcpy(path_copy, path);
-    int retval = find_path(path_copy, state->fs_cache, &entry);
+    int retval = find_path(path_copy, state->fs_cache, &entry, 1);
     free(path_copy);
 
     // Should be impossible for find_path to return an error if this code is correct.
@@ -753,7 +784,7 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
 
     // I'm assuming that all necessary validation for the path is done by b2fs_opendir, and that we
     // already know that the given path exists and is a directory.
-    directory = entry.directory;
+    directory = entry.dir.directory;
   } else {
     // User is asking to open /. Just use fs_cache.
     directory = state->fs_cache;
@@ -831,6 +862,8 @@ int b2fs_symlink(const char *from, const char *to) {
 // Function takes care of deleting a file. Performs (perhaps unnecessary) validation to make sure
 // the path isn't a directory, then removes the file from the local cache based on the deletion
 // policy. File is removed from B2 in the file version destructor.
+// FIXME: Function needs to be re-written to be threadsafe, and we also need to add some notion
+// of whether or not a particular file version is actually present in B2.
 int b2fs_unlink(const char *path) {
   b2fs_state_t *state = fuse_get_context()->private_data;
 
@@ -840,14 +873,20 @@ int b2fs_unlink(const char *path) {
     b2fs_hash_entry_t entry;
     char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
     strcpy(path_copy, path);
-    int retval = find_path(path_copy, state->fs_cache, &entry);
+    int retval = find_path(path_copy, state->fs_cache, &entry, 1);
     free(path_copy);
 
     if (retval == B2FS_SUCCESS) {
       // File exists. Time to do the hard work.
+      int synced = 0;
+
       if (state->config.policy != POLICY_HIDE) {
         // Figure out how many files we need to delete.
         int num_iterations = state->config.policy == POLICY_DELETE_ONE ? 1 : keytree_size(entry.file.versions);
+
+        // Make sure that our file versions have their corresponding ids.
+        b2_sync_versions(&entry.file);
+        synced = 1;
 
         // Iterate over versions and mark for deletion.
         size_t key;
@@ -865,18 +904,13 @@ int b2fs_unlink(const char *path) {
         destroy_stack(deletions);
       }
 
-      // Remove the file from the filesystem cache if all versions have been removed.
-      if (!keytree_size(entry.file.versions)) {
-        path_copy = malloc(sizeof(char) * strlen(path) + 1);
-        strcpy(path_copy, path);
-        char **path_pieces = split_path(path_copy);
-        hash_t *parent = make_path(path_pieces, state->fs_cache);
-        assert(hash_drop(parent, path_pieces[0]) == HASH_SUCCESS);
-        free(path_copy);
-      }
-
       // Hide the earliest remaining file if there is one.
       if (keytree_size(entry.file.versions) > 0) {
+        // Perform version sync if we didn't already do it.
+        // Operation is idempotent, so check is superfluous, but no reason to do
+        // extra work.
+        if (!synced) b2_sync_versions(&entry.file);
+
         // Do-while loop works as a conditional retry-loop if our auth token is expired.
         int do_again;
         do {
@@ -924,8 +958,6 @@ int b2fs_unlink(const char *path) {
               *version.hidden = 1;
               free(response.str);
             } else {
-              // FIXME: Most likely reason this would happen, assuming the code is correct, is due to an expired token. Need to
-              // add logic here to attempt a re-authentication.
               write_log(LEVEL_DEBUG, "B2FS: B2 returned error code %ld with message: %s\n", code, response.str);
 
               // Attempt to handle the returned error.
@@ -958,12 +990,20 @@ int b2fs_unlink(const char *path) {
           curl_slist_free_all(headers);
           curl_easy_cleanup(curl);
         } while (do_again);
-
-        // Lots of ways to get here, time to return.
-        return B2FS_SUCCESS;
-      } else {
-        return B2FS_SUCCESS;
       }
+
+      // Remove the file from the filesystem cache if all versions have been removed.
+      if (!keytree_size(entry.file.versions)) {
+        path_copy = malloc(sizeof(char) * strlen(path) + 1);
+        strcpy(path_copy, path);
+        char **path_pieces = split_path(path_copy);
+        hash_t *parent = make_path(path_pieces, state->fs_cache, NULL);
+        assert(hash_drop(parent, path_pieces[0]) == HASH_SUCCESS);
+        free(path_copy);
+        destroy_hash_entry(&entry);
+      }
+
+      return B2FS_SUCCESS;
     } else if (retval == B2FS_FS_NOENT_ERROR) {
       // File doesn't exist.
       return -ENOENT;
@@ -1064,7 +1104,7 @@ int b2fs_access(const char *path, int mode) {
     b2fs_hash_entry_t entry;
     char *path_copy = malloc(sizeof(char) * (strlen(path) + 1));
     strcpy(path_copy, path);
-    int retval = find_path(path_copy, state->fs_cache, &entry);
+    int retval = find_path(path_copy, state->fs_cache, &entry, 1);
     free(path_copy);
 
     // Error handling and return.
@@ -1093,6 +1133,49 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
   output->str[output->ptr + (size * nmembers)] = '\0';
   output->ptr += size *nmembers;
   return size * nmembers;
+}
+
+// Given a file entry, iterates across the file versions and checks for an incomplete
+// entry. If it finds any, overwrites them with B2 version.
+int b2_sync_versions(b2fs_file_entry_t *entry) {
+  int should_sync = 0, live = 0, counter = 0;
+  b2fs_state_t *state = fuse_get_context()->private_data;
+
+  // Iterate across cached file versions.
+  size_t timestamp;
+  b2fs_file_version_t version;
+  queue_t *syncables = create_queue(NULL, sizeof(b2fs_version_sync_state_t));
+  keytree_iterator_t *it = keytree_iterate_start(entry->versions, NULL);
+  while (keytree_iterate_next(it, &timestamp, &version) == KEYTREE_SUCCESS) {
+    b2fs_version_sync_state_t state;
+
+    if (*version.live) {
+      live = 1;
+      if (!*version.synced) {
+        should_sync = 1;
+        state.pos = counter;
+        state.timestamp = timestamp;
+        queue_enqueue(syncables, &state);
+      }
+      counter++;
+    }
+
+    // Soft assumption I'm making. Let's just make sure this holds.
+    if (live) assert(*version.live);
+  }
+
+  // Sync any entries needing it.
+  if (should_sync) {
+    // First get file history from B2.
+    keytree_t *history = create_keytree(NULL, destroy_file_version, rev_intcmp, sizeof(size_t), sizeof(b2fs_file_version_t));
+
+    // Really becoming frustrated with the B2 API, it's just so goddamn incomplete.
+    // There's no way to list the file versions for a particular file path, so we
+    // have to iterate across ALL FILES. The good news is that file versions at least
+    // show up contiguously for each file path, so we can jump out early.
+    // TODO: Revisit this sometime if B2 ever gets their shit together.
+    // TODO: Actually write this.
+  }
 }
 
 // As the name suggests, this function is responsible for attempting to fix an error returned
@@ -1281,15 +1364,38 @@ int init_file_version(b2fs_file_version_t *version) {
   if (!version) return B2FS_INVAL_ERROR;
 
   memset(version, 0, sizeof(b2fs_file_version_t));
-  version->should_delete = malloc(sizeof(int));
-  version->hidden = malloc(sizeof(int));
+  version->should_delete = malloc(MEMBER_PTR_SIZE(b2fs_file_version_t, should_delete));
+  version->hidden = malloc(MEMBER_PTR_SIZE(b2fs_file_version_t, hidden));
+  version->live = malloc(MEMBER_PTR_SIZE(b2fs_file_version_t, live));
+  version->synced = malloc(MEMBER_PTR_SIZE(b2fs_file_version_t, synced));
   *version->should_delete = 0;
   *version->hidden = 0;
-  if (version->should_delete && version->hidden) {
+  *version->live = 0;
+  *version->synced = 0;
+  if (version->should_delete && version->hidden && version->live && version->synced) {
     return B2FS_SUCCESS;
   } else {
     if (version->should_delete) free(version->should_delete);
     if (version->hidden) free(version->hidden);
+    if (version->live) free(version->live);
+    if (version->synced) free(version->synced);
+    return B2FS_NOMEM_ERROR;
+  }
+}
+
+int init_dir_entry(b2fs_dir_entry_t *entry) {
+  if (!entry) return B2FS_INVAL_ERROR;
+
+  memset(entry, 0, sizeof(b2fs_dir_entry_t));
+  entry->directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
+  entry->hidden = malloc(MEMBER_PTR_SIZE(b2fs_dir_entry_t, hidden));
+  *entry->hidden = 0;
+
+  if (entry->hidden && entry->directory) {
+    return B2FS_SUCCESS;
+  } else {
+    if (entry->directory) hash_destroy(entry->directory);
+    if (entry->hidden) free(entry->hidden);
     return B2FS_NOMEM_ERROR;
   }
 }
@@ -1306,7 +1412,7 @@ void destroy_file_version(void *voidarg) {
   b2fs_state_t *state = fuse_get_context()->private_data;
   b2fs_file_version_t *version = voidarg;
 
-  if (version->should_delete) {
+  if (version->should_delete && version->live) {
     // Do-While loop works as a conditional retry-loop if our auth token is expired.
     int do_again;
     do {
@@ -1381,13 +1487,21 @@ void destroy_file_version(void *voidarg) {
   }
 
   free(version->should_delete);
+  free(version->hidden);
+  free(version->live);
+  free(version->synced);
+}
+
+void destroy_dir_entry(b2fs_dir_entry_t *entry) {
+  hash_destroy(entry->directory);
+  free(entry->hidden);
 }
 
 void destroy_hash_entry(void *voidarg) {
   b2fs_hash_entry_t *entry = voidarg;
 
   // Identify entry type and destroy.
-  if (entry->type == TYPE_DIRECTORY) hash_destroy(entry->directory);
+  if (entry->type == TYPE_DIRECTORY) hash_destroy(entry->dir.directory);
   else destroy_file_entry(&entry->file);
 }
 
@@ -1412,7 +1526,7 @@ char **split_path(char *path) {
   return parts;
 }
 
-hash_t *make_path(char **path_pieces, hash_t *base) {
+hash_t *make_path(char **path_pieces, hash_t *base, b2fs_dir_entry_t *output) {
   hash_t *current = base;
   int i = 0;
 
@@ -1425,7 +1539,7 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
       // Create a new hash entry of type directory.
       b2fs_hash_entry_t new_entry;
       new_entry.type = TYPE_DIRECTORY;
-      new_entry.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
+      init_dir_entry(&new_entry.dir);
 
       // Put it in the previous directory.
       hash_put(current, piece, &new_entry);
@@ -1435,7 +1549,8 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
       return NULL;
     }
 
-    current = entry.directory;
+    current = entry.dir.directory;
+    if (output) memcpy(output, &entry.dir, sizeof(b2fs_dir_entry_t));
   }
 
   // Move final piece up to front of array for ease of access.
@@ -1445,7 +1560,7 @@ hash_t *make_path(char **path_pieces, hash_t *base) {
   return current;
 }
 
-int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf) {
+int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf, int honor_hidden) {
   char **path_pieces = split_path(path);
   int i = 0;
   hash_t *current = base;
@@ -1455,9 +1570,10 @@ int find_path(char *path, hash_t *base, b2fs_hash_entry_t *buf) {
     // Get the entry and perform basic validation.
     int retval = hash_get(current, piece, &entry);
     if (retval != HASH_SUCCESS) return B2FS_FS_NOENT_ERROR;
+    else if (honor_hidden && entry.type == TYPE_DIRECTORY && *entry.dir.hidden) return B2FS_FS_NOENT_ERROR;
     else if (entry.type == TYPE_FILE && path_pieces[i]) return B2FS_FS_NOTDIR_ERROR;
 
-    if (entry.type == TYPE_DIRECTORY) current = entry.directory;
+    if (entry.type == TYPE_DIRECTORY) current = entry.dir.directory;
   }
 
   // Return whatever we found.
@@ -1484,7 +1600,7 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
 
     // Attempt to locate the parent directory and return an error if it can't be found.
     b2fs_hash_entry_t entry;
-    int retval = find_path(parent_path, base, &entry);
+    int retval = find_path(parent_path, base, &entry, 1);
     free(parent_path);
     if (retval == B2FS_FS_NOTDIR_ERROR || entry.type != TYPE_DIRECTORY) {
       free(child_path);
@@ -1493,7 +1609,7 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
       free(child_path);
       return -ENOENT;
     }
-    parent = entry.directory;
+    parent = entry.dir.directory;
   } else {
     // We're inserting into the root directory.
     parent = base;
@@ -1503,14 +1619,77 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
   b2fs_hash_entry_t created;
   created.type = type;
   if (type == TYPE_FILE) init_file_entry(&created.file);
-  else created.directory = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
+  else init_dir_entry(&created.dir);
 
   // Insert the requested entry into the filesystem cache. B2 doesn't support empty files
   // or directories, so we just need to keep track of the fact that it exists until the
   // user decides to write some data.
   int retval = hash_put(parent, child_path, &created);
-  if (retval == HASH_SUCCESS) return B2FS_SUCCESS;
-  else return -EEXIST;
+  if (retval == HASH_EXISTS_ERROR) {
+    // The entry we tried to insert already exists. Obviously this may mean that the requested
+    // path already exists, however, it could also mean that the user previously requested to
+    // delete the path, but that we're set to hide files instead of actually deleting them.
+    // Check which is the case.
+    b2fs_hash_entry_t entry;
+    hash_get(parent, child_path, &entry);
+    if (type == TYPE_FILE) {
+      b2fs_file_version_t version;
+
+      // Get most recent version of file.
+      keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
+      assert(keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS);
+      keytree_iterate_stop(it);
+
+      if (!*entry.dir.hidden) {
+        destroy_file_entry(&created.file);
+        return -EEXIST;
+      }
+    } else {
+      if (*entry.dir.hidden) {
+        // Mark directory as no longer hidden and delete .b2fs_hidefile on B2 to persist.
+        *entry.dir.hidden = 0;
+
+        b2fs_hash_entry_t hide_entry;
+        hash_t *directory = entry.dir.directory;
+        assert(hash_get(directory, ".b2fs_hidefile", &hide_entry) == HASH_SUCCESS);
+
+        // FIXME: Visit this in the future when b2_sync_versions has been written.
+        // Currently ignores return value of b2_sync_versions, but we need to verify
+        // that this won't leave us in an unacceptable state.
+        b2_sync_versions(&hide_entry.file);
+        destroy_file_entry(&hide_entry);
+      } else {
+        // Directory actually exists.
+        destroy_dir_entry(&created.dir);
+        return -EEXIST;
+      }
+    }
+  } else if (retval != HASH_SUCCESS) {
+    // Hash reported an unexpected error. Most likely means that we're out of memory, or
+    // code is in an invalid state. Report a generic IO error for now.
+    write_log(LEVEL_DEBUG, "B2FS: Hash returned an unexpected error in internal_make...");
+    return -EIO;
+  }
+
+  // If we've gotten to this point, we've either successfully created a directory
+  // or we've ensured that the file we're creating either doesn't exist, or is currently
+  // hidden. If we're working with a file, we need to insert a file version into the
+  // version tree.
+  // FIXME: Slight caveat here. As we're just creating the file, and don't know what it's
+  // contents will be, we can't get a file-id from B2, and as such this entry will be
+  // incomplete. In downstream functions, like b2fs_unlink, we'll need to sync with B2
+  // to get the information from B2.
+  if (type == TYPE_FILE) {
+    b2fs_hash_entry_t entry;
+    b2fs_file_version_t version;
+    init_file_version(&version);
+    hash_get(parent, child_path, &entry);
+
+    size_t timestamp = (size_t) time(NULL);
+    keytree_insert(entry.file.versions, &timestamp, &version);
+  }
+
+  return B2FS_SUCCESS;
 }
 
 int jsmn_iskey(const char *json, jsmntok_t *tok, const char *s) {
