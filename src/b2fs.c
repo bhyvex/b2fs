@@ -877,7 +877,6 @@ int b2fs_unlink(const char *path) {
         hash_t *parent = make_path(path_pieces, state->fs_cache, NULL);
         assert(hash_drop(parent, path_pieces[0]) == HASH_SUCCESS);
         free(path_copy);
-        destroy_hash_entry(&entry);
       }
 
       return B2FS_SUCCESS;
@@ -1519,7 +1518,6 @@ void destroy_file_entry(void *voidarg) {
   keytree_destroy(entry->chunks);
   keytree_destroy(entry->versions);
   destroy_bitmap(entry->chunkmap);
-  free(entry);
 }
 
 void destroy_file_version(void *voidarg) {
@@ -1543,7 +1541,7 @@ void destroy_file_version(void *voidarg) {
       INITIALIZE_LIBCURL(
           curl,
           state->api_url,
-          "b2api/b1/b2_delete_file_version",
+          "b2api/v1/b2_delete_file_version",
           state->token,
           state->lock,
           "Authorization: %s",
