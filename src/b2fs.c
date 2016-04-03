@@ -224,7 +224,7 @@ int b2fs_access(const char *path, int mode);
 // Network Functions.
 int b2_list_versions(hash_t *fs_cache, const char *target_path, keytree_t *synced);
 size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg);
-int b2_sync_versions(b2fs_file_entry_t *entry, const char *path);
+int b2_sync_versions(b2fs_file_entry_t *entry, const char *path, int force);
 int handle_b2_error(b2fs_state_t *state, char *response, char *cached_token);
 int handle_authentication(b2fs_state_t *state, char *account_id, char *app_key);
 
@@ -250,7 +250,7 @@ int parse_config(b2fs_config_t *config, char *config_filename);
 void find_tmpdir(char **out);
 int intcmp(void *int_one, void *int_two);
 int rev_intcmp(void *int_one, void *int_two);
-void dereference_and_destroy(void *destroyed);
+void dereference_and_free(void *destroyed);
 void print_usage(int intentional);
 
 /*----- Local Function Implementations -----*/
@@ -424,7 +424,7 @@ void *b2fs_init(struct fuse_conn_info *info) {
 
   // Initialize global data structures.
   state->fs_cache = create_hash(sizeof(b2fs_hash_entry_t), destroy_hash_entry);
-  state->id_mappings = create_hash(sizeof(char *), dereference_and_destroy);
+  state->id_mappings = create_hash(sizeof(char *), dereference_and_free);
   if (!state->fs_cache || !state->id_mappings) {
     write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
     if (state->fs_cache) hash_destroy(state->fs_cache);
@@ -465,55 +465,19 @@ void *b2fs_init(struct fuse_conn_info *info) {
 
   // Create storage for the current total path and path section.
   b2fs_string_t current_path;
-  char current_section[B2FS_MED_GENERIC_BUFFER];
   memset(&current_path, 0, sizeof(b2fs_string_t));
-  memset(current_section, 0, sizeof(char) * B2FS_MED_GENERIC_BUFFER);
-  current_path.str = malloc(sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
-  current_path.len = B2FS_SMALL_GENERIC_BUFFER;
+  current_path.str = malloc(sizeof(char) * 1);
+  current_path.ptr = 0;
+  current_path.len = 1;
+  *current_path.str = '\0';
 
   // Create queues.
-  queue_t *dirs = create_queue(NULL, sizeof(b2fs_hash_entry_t)), *sections = create_queue(NULL, sizeof(char) * B2FS_MED_GENERIC_BUFFER);
+  queue_t *dirs = create_queue(NULL, sizeof(b2fs_hash_entry_t)), *paths = create_queue(NULL, sizeof(b2fs_string_t));
   queue_enqueue(dirs, &start_entry);
-  queue_enqueue(sections, &current_section);
+  queue_enqueue(paths, &current_path);
   while (queue_dequeue(dirs, &current_entry) == QUEUE_SUCCESS) {
     // Get the name of the current path section.
-    assert(queue_dequeue(sections, &current_section) == QUEUE_SUCCESS);
-
-    if (!strcmp(current_section, "..")) {
-      // We've reached the end of a directory.
-      while (*(current_path.str + --current_path.ptr) != '/');
-
-      // FIXME: Remove this after development.
-      assert(current_path.ptr >= 0);
-
-      *(current_path.str + current_path.ptr) = '\0';
-      continue;
-    }
-
-    // Append the current section onto the end of the path.
-    int len = strlen(current_section);
-    if (current_path.ptr + len > current_path.len) {
-      // String is too small, add more room.
-      current_path.len = MAX(current_path.len * 2, current_path.ptr + len + 1);
-      void *tmp = realloc(current_path.str, sizeof(char) * current_path.len);
-      if (!tmp) {
-        // Memory couldn't be allocated for the string. We're still in startup, so
-        // just fail out.
-        write_log(LEVEL_DEBUG, "B2FS: String allocation failed during startup...\n");
-        write_log(LEVEL_ERROR, "B2FS: Could not allocate enough memory to start up.\n");
-        free(current_path.str);
-        destroy_queue(dirs);
-        destroy_queue(sections);
-        hash_destroy(state->fs_cache);
-        hash_destroy(state->id_mappings);
-        fuse_exit(fuse_get_context()->fuse);
-      }
-      current_path.str = tmp;
-    }
-    *(current_path.str + current_path.ptr++) = '/';
-    strcpy(current_path.str + current_path.ptr, current_section);
-    current_path.ptr += len;
-    *(current_path.str + current_path.ptr) = '\0';
+    assert(queue_dequeue(paths, &current_path) == QUEUE_SUCCESS);
 
     if (current_entry.type == TYPE_FILE) {
       // Finally, what we're actually doing all of this for.
@@ -521,8 +485,9 @@ void *b2fs_init(struct fuse_conn_info *info) {
       b2fs_file_version_t version;
 
       // Iterate across versions and cache each id->path.
-      while (keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS) {
-        char *path_copy = malloc(sizeof(char) * current_path.ptr);
+      int num_iterations = keytree_size(current_entry.file.versions);
+      while (num_iterations-- && keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS) {
+        char *path_copy = malloc(sizeof(char) * current_path.len);
         strcpy(path_copy, current_path.str);
         hash_put(state->id_mappings, version.version_id, &path_copy);
       }
@@ -532,26 +497,37 @@ void *b2fs_init(struct fuse_conn_info *info) {
       // Current entry is a directory, add all of its contents to the queue.
       char **contents = hash_keys(current_entry.dir.directory, NULL);
       for (int i = 0; i < hash_count(current_entry.dir.directory); i++) {
+        // Get current entry.
         b2fs_hash_entry_t tmp_entry;
+        b2fs_string_t tmp_path;
         char *entry = contents[i];
-        strcpy(current_section, entry);
 
-        assert(hash_get(current_entry.dir.directory, current_section, &tmp_entry) == HASH_SUCCESS);
+        // Length of string without the null termination character.
+        // The plus 1 is for the inserted slash.
+        int len = current_path.ptr + strlen(entry) + 1;
+
+        // Create path for current entry.
+        tmp_path.str = malloc(sizeof(char) * (len + 1));
+        tmp_path.len = len + 1;
+        strcpy(tmp_path.str, current_path.str);
+        tmp_path.ptr = current_path.ptr;
+        *(tmp_path.str + tmp_path.ptr++) = '/';
+        strcpy(tmp_path.str + tmp_path.ptr, entry);
+        tmp_path.ptr = len;
+
+        // Enqueue for future processing.
+        assert(hash_get(current_entry.dir.directory, entry, &tmp_entry) == HASH_SUCCESS);
         queue_enqueue(dirs, &tmp_entry);
-        queue_enqueue(sections, &current_section);
+        queue_enqueue(paths, &tmp_path);
       }
-
-      // Enqueue a stop record to signify that the directory is finished.
-      strcpy(current_section, "..");
-      queue_enqueue(dirs, &current_entry);
-      queue_enqueue(sections, &current_section);
-
       free(contents);
     }
+
+    // Cleanup the string.
+    free(current_path.str);
   }
   destroy_queue(dirs);
-  destroy_queue(sections);
-  free(current_path.str);
+  destroy_queue(paths);
 
   // Boy, that was long and complicated, but now we're done.
   return state;
@@ -586,8 +562,6 @@ int b2fs_getattr(const char *path, struct stat *statbuf) {
     // directory is hidden.
     size_t timestamp;
     if (entry.type == TYPE_FILE) {
-      b2fs_file_version_t version;
-
       // Get most recent version of file.
       keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
       assert(keytree_iterate_next(it, &timestamp, &version) == KEYTREE_SUCCESS);
@@ -705,6 +679,7 @@ int b2fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offs
       // Get the most recent version.
       keytree_iterator_t *it = keytree_iterate_start(entry.file.versions, NULL);
       assert(keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS);
+      keytree_iterate_stop(it);
 
       // Return the entry if it's not hidden.
       if (!*version.hidden) filler(buf, keys[i], NULL, 0);
@@ -787,7 +762,7 @@ int b2fs_unlink(const char *path) {
         int num_iterations = state->config.policy == POLICY_DELETE_ONE ? 1 : keytree_size(entry.file.versions);
 
         // Make sure that our file versions have their corresponding ids.
-        b2_sync_versions(&entry.file, path);
+        b2_sync_versions(&entry.file, path, 0);
         synced = 1;
 
         // Iterate over versions and mark for deletion.
@@ -811,7 +786,7 @@ int b2fs_unlink(const char *path) {
         // Perform version sync if we didn't already do it.
         // Operation is idempotent, so check is superfluous, but no reason to do
         // extra work.
-        if (!synced) b2_sync_versions(&entry.file, path);
+        if (!synced) b2_sync_versions(&entry.file, path, 0);
 
         // Do-while loop works as a conditional retry-loop if our auth token is expired.
         int do_again;
@@ -846,7 +821,7 @@ int b2fs_unlink(const char *path) {
 
           // Get the name of the file exactly as B2 expects it and create the request body.
           assert(hash_get(state->id_mappings, version.version_id, &filename) == HASH_SUCCESS);
-          sprintf(body, "{\"bucketId\":\"%s\",\"fileName\":\"%s\"}", state->config.bucket_id, filename);
+          sprintf(body, "{\"bucketId\":\"%s\",\"fileName\":\"%s\"}", state->config.bucket_id, filename + 1);
           curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 
           // Perform the request.
@@ -1036,6 +1011,10 @@ int b2_list_versions(hash_t *fs_cache, const char *target_path, keytree_t *synce
     memset(start_fileid, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
     memset(start_filename, 0, sizeof(char) * B2FS_SMALL_GENERIC_BUFFER);
 
+    // If the caller is requesting a specific file, request to start listing file versions
+    // from there.
+    if (target_path) strcpy(start_filename, target_path);
+
     // Big, dirty, macro to handle all of the boilerplate cURL initialization stuff.
     // Acquire read-lock to ensure we're using the most recent auth tokens and everything.
     pthread_rwlock_rdlock(&state->lock);
@@ -1057,14 +1036,13 @@ int b2_list_versions(hash_t *fs_cache, const char *target_path, keytree_t *synce
     int found_file = 0;
     while (!found_file && strcmp(start_filename, "null") && strcmp(start_fileid, "null")) {
       // Set POST body.
-      if (strlen(start_filename) || strlen(start_fileid)) {
-        // Quick sanity checking.
-        assert(strlen(start_filename) && strlen(start_fileid));
-
+      if (strlen(start_filename) && strlen(start_fileid)) {
         // I hate putting single calls on multiple lines, but this is otherwise too long.
         sprintf(body,
             "{\"bucketId\":\"%s\",\"startFileName\":\"%s\",\"startFileId\":\"%s\",\"maxFileCount\":1000}",
             state->config.bucket_id, start_filename, start_fileid);
+      } else if (strlen(start_filename)) {
+        sprintf(body, "{\"bucketId\":\"%s\",\"startFileName\":\"%s\"}", state->config.bucket_id, start_filename);
       } else {
         sprintf(body, "{\"bucketId\":\"%s\",\"maxFileCount\":1000}", state->config.bucket_id);
       }
@@ -1115,8 +1093,8 @@ int b2_list_versions(hash_t *fs_cache, const char *target_path, keytree_t *synce
                 jsmntok_t *file = &tokens[token_index++];
                 b2fs_hash_entry_t entry;
                 b2fs_file_version_t version;
-                char **path_pieces, filename[B2FS_MED_GENERIC_BUFFER], *id_mapping;
-                long size, timestamp;
+                char **path_pieces, filename[B2FS_MED_GENERIC_BUFFER];
+                long timestamp;
 
                 // Initialize this file version.
                 init_file_version(&version);
@@ -1149,6 +1127,18 @@ int b2_list_versions(hash_t *fs_cache, const char *target_path, keytree_t *synce
                     // Set the  hidden flag if the action is set to hide.
                     if (!strncmp(response.str + obj_value->start, "hide", obj_len)) {
                       *version.hidden = 1;
+                    }
+                  } else {
+                    // Unknown key returned from B2. Not necessarily a problem, but we need
+                    // to make sure it doesn't screw up our parsing.
+                    switch (obj_value->type) {
+                      case JSMN_OBJECT:
+                        token_index += obj_value->size * 2;
+                        break;
+                      case JSMN_ARRAY:
+                        token_index += obj_value->size;
+                      default:
+                        break;
                     }
                   }
                 }
@@ -1268,43 +1258,24 @@ size_t receive_string(void *data, size_t size, size_t nmembers, void *voidarg) {
 
 // Given a file entry, iterates across the file versions and checks for an incomplete
 // entry. If it finds any, replaced them all with B2 version.
-int b2_sync_versions(b2fs_file_entry_t *entry, const char *path) {
-  int should_sync = 0, live = 0, counter = 0;
-  b2fs_state_t *state = fuse_get_context()->private_data;
+int b2_sync_versions(b2fs_file_entry_t *entry, const char *path, int force) {
+  int should_sync = force;
 
   // Iterate across cached file versions.
-  size_t timestamp;
   b2fs_file_version_t version;
-  queue_t *syncables = create_queue(NULL, sizeof(b2fs_version_sync_state_t));
+  int num_iterations = keytree_size(entry->versions);
   keytree_iterator_t *it = keytree_iterate_start(entry->versions, NULL);
-  while (keytree_iterate_next(it, &timestamp, &version) == KEYTREE_SUCCESS) {
-    b2fs_version_sync_state_t state;
-
-    if (*version.live) {
-      live = 1;
-      if (!*version.synced) {
-        should_sync = 1;
-        state.pos = counter;
-        state.timestamp = timestamp;
-        queue_enqueue(syncables, &state);
-      }
-      counter++;
-    }
-
-    // Soft assumption I'm making. Let's just make sure this holds.
-    if (live) assert(*version.live);
+  while (num_iterations-- && !should_sync && keytree_iterate_next(it, NULL, &version) == KEYTREE_SUCCESS) {
+    if (*version.live && !*version.synced) should_sync = 1;
   }
+  keytree_iterate_stop(it);
 
   // Sync any entries needing it.
   if (should_sync) {
     // First get file history from B2.
     keytree_t *versions = create_keytree(NULL, destroy_file_version, rev_intcmp, sizeof(size_t), sizeof(b2fs_file_version_t));
 
-    // Really becoming frustrated with the B2 API, it's just so goddamn incomplete.
-    // There's no way to list the file versions for a particular file path, so we
-    // have to iterate across ALL FILES. The good news is that file versions at least
-    // show up contiguously for each file path, so we can jump out early.
-    // TODO: Revisit this sometime if B2 ever gets their shit together.
+    // Call list_versions with a given path. Should hopefully only require one call.
     int retval = b2_list_versions(NULL, path, versions);
 
     // Check if our sync was a success, and if so, destroy and overwrite the old history.
@@ -1584,11 +1555,13 @@ void destroy_file_version(void *voidarg) {
       // Get file name.
       char *filename;
       assert(hash_get(state->id_mappings, version->version_id, &filename) == HASH_SUCCESS);
-      hash_drop(state->id_mappings, version->version_id);
 
       // Set POST body.
-      sprintf(body, "{\"fileName\":\"%s\",\"fileId\":\"%s\"}", filename, version->version_id);
+      sprintf(body, "{\"fileName\":\"%s\",\"fileId\":\"%s\"}", filename + 1, version->version_id);
       curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+
+      // Remove the file version from the version map.
+      hash_drop(state->id_mappings, version->version_id);
 
       // Perform the request.
       if ((res = curl_easy_perform(curl)) == CURLE_OK) {
@@ -1607,7 +1580,7 @@ void destroy_file_version(void *voidarg) {
           int retval = handle_b2_error(state, response.str, tok);
 
           // Clean up resources.
-          free(response.str);
+          if (response.str) free(response.str);
           memset(&response, 0, sizeof(b2fs_string_t));
 
           // Take necessary action based on error handling results.
@@ -1793,13 +1766,24 @@ int internal_make(const char *path, hash_t *base, b2fs_entry_type_t type) {
         *entry.dir.hidden = 0;
 
         b2fs_hash_entry_t hide_entry;
+        b2fs_file_version_t hide_version;
         hash_t *directory = entry.dir.directory;
         assert(hash_get(directory, ".b2fs_hidefile", &hide_entry) == HASH_SUCCESS);
 
         // FIXME: Visit this in the future when b2_sync_versions has been written.
         // Currently ignores return value of b2_sync_versions, but we need to verify
         // that this won't leave us in an unacceptable state.
-        b2_sync_versions(&hide_entry.file, path);
+        b2_sync_versions(&hide_entry.file, path, 0);
+
+        // There should only be one version of this file, but just iterate over them
+        // and set each deletion flag to make sure the destructor will actually delete them.
+        int num_iterations = keytree_size(hide_entry.file.versions);
+        keytree_iterator_t *it = keytree_iterate_start(hide_entry.file.versions, NULL);
+        while (num_iterations-- && keytree_iterate_next(it, NULL, &hide_version) == KEYTREE_SUCCESS) {
+          *hide_version.should_delete = 1;
+        }
+        keytree_iterate_stop(it);
+
         destroy_file_entry(&hide_entry);
       } else {
         // Directory actually exists.
@@ -1940,7 +1924,7 @@ int rev_intcmp(void *int_one, void *int_two) {
   return *((int *) int_two) - *((int *) int_one);
 }
 
-void dereference_and_destroy(void *destroyed) {
+void dereference_and_free(void *destroyed) {
   free(*(char **) destroyed);
 }
 
