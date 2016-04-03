@@ -257,7 +257,7 @@ char **hash_keys(hash_t *table, int *count) {
 
   // Iterate across each array index, and each hash_node chain.
   pthread_rwlock_rdlock(&table->lock);
-  *count = table->count;
+  if (count) *count = table->count;
   for (int i = 0; i < table->size; i++) {
     if (table->data[i]) {
       for (hash_node_t *tmp = table->data[i]; tmp; tmp = tmp->next) {
